@@ -1,4 +1,4 @@
-//===--- ImageInspectionStatic.cpp ----------------------------------------===//
+//===--- ImageInspectionStatic.cpp - image inspection for static stdlib ---===//
 //
 // This source file is part of the Swift.org open source project
 //
@@ -9,45 +9,70 @@
 // See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
-//
-// Implementation of functions to read data sections from static executable.
-//
+///
+/// \file
+///
+/// Implementation of ImageInspection for static stdlib (no dynamic loader
+/// present) environments. Assumes that only a single image exists in memory.
+///
 //===----------------------------------------------------------------------===//
 
-// Currently only tested on linux but should work for any ELF platform
-#if defined(__ELF__) && defined(__linux__)
+#if defined(__MACH__) && defined(SWIFT_RUNTIME_MACHO_NO_DYLD)
 
 #include "ImageInspection.h"
-#include <cstring>
-
-// These are defined in swift_sections.S to mark the start of a section with the
-// length of the data followed immediately by the section data
-struct alignas(uint64_t) Section;
-extern const Section protocolConformancesStart asm(".swift2_protocol_conformances_start");
-extern const Section typeMetadataStart asm(".swift2_type_metadata_start");
+#include "ImageInspectionCommon.h"
 
 using namespace swift;
 
-static SectionInfo
-getSectionInfo(const Section *section) {
-  SectionInfo info;
-  memcpy(&info.size, section, sizeof(uint64_t));
-  info.data = reinterpret_cast<const char *>(section) + sizeof(uint64_t);
-  return info;
+#define GET_SECTION_START_AND_SIZE(start, size, _seg, _sec)                    \
+  extern void *__s##_seg##_sec __asm("section$start$" _seg "$" _sec);          \
+  extern void *__e##_seg##_sec __asm("section$end$" _seg "$" _sec);            \
+  start = &__s##_seg##_sec;                                                    \
+  size = (char *)&__e##_seg##_sec - (char *)&__s##_seg##_sec;
+
+void swift::initializeProtocolLookup() {
+  void *start;
+  uintptr_t size;
+  GET_SECTION_START_AND_SIZE(start, size, MachOTextSegment,
+                             MachOProtocolsSection);
+  if (start == nullptr || size == 0)
+    return;
+  addImageProtocolsBlockCallbackUnsafe(start, size);
 }
 
-void
-swift::initializeProtocolConformanceLookup() {
-  auto protocolConformances = getSectionInfo(&protocolConformancesStart);
-  addImageProtocolConformanceBlockCallback(protocolConformances.data,
-                                           protocolConformances.size);
+void swift::initializeProtocolConformanceLookup() {
+  void *start;
+  uintptr_t size;
+  GET_SECTION_START_AND_SIZE(start, size, MachOTextSegment,
+                             MachOProtocolConformancesSection);
+  if (start == nullptr || size == 0)
+    return;
+  addImageProtocolConformanceBlockCallbackUnsafe(start, size);
+}
+void swift::initializeTypeMetadataRecordLookup() {
+  void *start;
+  uintptr_t size;
+  GET_SECTION_START_AND_SIZE(start, size, MachOTextSegment,
+                             MachOTypeMetadataRecordSection);
+  if (start == nullptr || size == 0)
+    return;
+  addImageTypeMetadataRecordBlockCallbackUnsafe(start, size);
 }
 
-void
-swift::initializeTypeMetadataRecordLookup() {
-  auto typeMetadata = getSectionInfo(&typeMetadataStart);
-  addImageTypeMetadataRecordBlockCallback(typeMetadata.data,
-                                          typeMetadata.size);
+void swift::initializeDynamicReplacementLookup() {
+  void *start1;
+  uintptr_t size1;
+  GET_SECTION_START_AND_SIZE(start1, size1, MachOTextSegment,
+                             MachODynamicReplacementSection);
+  if (start1 == nullptr || size1 == 0)
+    return;
+  void *start2;
+  uintptr_t size2;
+  GET_SECTION_START_AND_SIZE(start2, size2, MachOTextSegment,
+                             MachODynamicReplacementSection);
+  if (start2 == nullptr || size2 == 0)
+    return;
+  addImageDynamicReplacementBlockCallback(start1, size1, start2, size2);
 }
 
-#endif // defined(__ELF__) && defined(__linux__)
+#endif // defined(__MACH__) && defined(SWIFT_RUNTIME_MACHO_NO_DYLD)

@@ -18,8 +18,8 @@ public func _opaqueIdentity<T>(_ x: T) -> T {
   ptr.initialize(to: x)
   let result =
     UnsafeMutablePointer<T>(_getPointer(OpaquePointer(ptr))).pointee
-  ptr.deinitialize()
-  ptr.deallocate(capacity: 1)
+  ptr.deinitialize(count: 1)
+  ptr.deallocate()
   return result
 }
 
@@ -71,7 +71,7 @@ public func getFloat32(_ x: Float32) -> Float32 { return _opaqueIdentity(x) }
 @inline(never)
 public func getFloat64(_ x: Float64) -> Float64 { return _opaqueIdentity(x) }
 
-#if arch(i386) || arch(x86_64)
+#if !(os(Windows) || os(Android)) && (arch(i386) || arch(x86_64))
 @inline(never)
 public func getFloat80(_ x: Float80) -> Float80 { return _opaqueIdentity(x) }
 #endif
@@ -79,4 +79,3 @@ public func getFloat80(_ x: Float80) -> Float80 { return _opaqueIdentity(x) }
 public func getPointer(_ x: OpaquePointer) -> OpaquePointer {
   return _opaqueIdentity(x)
 }
-

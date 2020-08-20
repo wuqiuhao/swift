@@ -21,7 +21,7 @@
 #define SWIFT_AST_CONFORMANCE_LOOKUP_TABLE_H
 
 #include "swift/AST/DeclContext.h"
-#include "swift/AST/TypeLoc.h"
+#include "swift/Basic/Debug.h"
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/SourceLoc.h"
 #include "llvm/ADT/MapVector.h"
@@ -42,7 +42,7 @@ class ModuleDecl;
 class ConformanceLookupTable {
   /// Describes the stage at which a particular nominal type or
   /// extension's conformances has been processed.
-  enum class ConformanceStage : unsigned char {
+  enum class ConformanceStage : uint8_t {
     /// The explicit conformances have been recorded in the lookup table.
     RecordedExplicit,
 
@@ -78,13 +78,6 @@ class ConformanceLookupTable {
                      std::array<LastProcessedEntry, NumConformanceStages>>
   LastProcessed;
   
-  /// The list of parsed extension declarations that have been delayed because
-  /// no resolver was available at the time.
-  ///
-  /// FIXME: This is insane. The resolver should be there or we shouldn't
-  /// have parsed extensions.
-  llvm::SetVector<ExtensionDecl *> DelayedExtensionDecls[NumConformanceStages];
-
   struct ConformanceEntry;
 
   /// Describes the "source" of a conformance, indicating where the
@@ -296,9 +289,7 @@ class ConformanceLookupTable {
     void *operator new(size_t Bytes, ASTContext &C,
                        unsigned Alignment = alignof(ConformanceEntry));
 
-    LLVM_ATTRIBUTE_DEPRECATED(
-      void dump() const LLVM_ATTRIBUTE_USED,
-        "only for use within the debugger");
+    SWIFT_DEBUG_DUMP;
     void dump(raw_ostream &os, unsigned indent = 0) const;
   };
 
@@ -331,17 +322,16 @@ class ConformanceLookupTable {
   bool VisitingSuperclass = false;
 
   /// Add a protocol.
-  bool addProtocol(NominalTypeDecl *nominal,
-                   ProtocolDecl *protocol, SourceLoc loc,
+  bool addProtocol(ProtocolDecl *protocol, SourceLoc loc,
                    ConformanceSource source);
 
   /// Add the protocols from the given list.
-  void addProtocols(NominalTypeDecl *nominal, ArrayRef<TypeLoc> inherited,
-                    ConformanceSource source, LazyResolver *resolver);
+  void addInheritedProtocols(
+      llvm::PointerUnion<const TypeDecl *, const ExtensionDecl *> decl,
+      ConformanceSource source);
 
   /// Expand the implied conformances for the given DeclContext.
-  void expandImpliedConformances(NominalTypeDecl *nominal, DeclContext *dc,
-                                 LazyResolver *resolver);
+  void expandImpliedConformances(NominalTypeDecl *nominal, DeclContext *dc);
 
   /// A three-way ordering
   enum class Ordering {
@@ -363,8 +353,7 @@ class ConformanceLookupTable {
   ///
   /// \returns true if any conformance entries were superseded by this
   /// operation.
-  bool resolveConformances(NominalTypeDecl *nominal,
-                           ProtocolDecl *protocol);
+  bool resolveConformances(ProtocolDecl *protocol);
 
   /// Retrieve the declaration context that provides the
   /// (non-inherited) conformance described by the given conformance
@@ -392,7 +381,6 @@ class ConformanceLookupTable {
   template<typename NominalFunc, typename ExtensionFunc>
   void forEachInStage(ConformanceStage stage,
                       NominalTypeDecl *nominal,
-                      LazyResolver *resolver,
                       NominalFunc nominalFunc,
                       ExtensionFunc extensionFunc);
 
@@ -410,23 +398,19 @@ class ConformanceLookupTable {
   /// on the superclass declaration itself will be inherited.
   void inheritConformances(ClassDecl *classDecl, 
                            ClassDecl *superclassDecl,
-                           ExtensionDecl *superclassExt,
-                           LazyResolver *resolver);
+                           ExtensionDecl *superclassExt);
 
   /// Update a lookup table with conformances from newly-added extensions.
-  void updateLookupTable(NominalTypeDecl *nominal, ConformanceStage stage,
-                         LazyResolver *resolver);
+  void updateLookupTable(NominalTypeDecl *nominal, ConformanceStage stage);
 
   /// Load all of the protocol conformances for the given (serialized)
   /// declaration context.
-  void loadAllConformances(NominalTypeDecl *nominal,
-                           DeclContext *dc,
+  void loadAllConformances(DeclContext *dc,
                            ArrayRef<ProtocolConformance *> conformances);
 
 public:
   /// Create a new conformance lookup table.
-  ConformanceLookupTable(ASTContext &ctx, NominalTypeDecl *nominal,
-                         LazyResolver *resolver);
+  ConformanceLookupTable(ASTContext &ctx);
 
   /// Destroy the conformance table.
   void destroy();
@@ -448,13 +432,11 @@ public:
   bool lookupConformance(ModuleDecl *module,
                          NominalTypeDecl *nominal,
                          ProtocolDecl *protocol, 
-                         LazyResolver *resolver,
                          SmallVectorImpl<ProtocolConformance *> &conformances);
 
   /// Look for all of the conformances within the given declaration context.
   void lookupConformances(NominalTypeDecl *nominal,
                           DeclContext *dc,
-                          LazyResolver *resolver,
                           ConformanceLookupKind lookupKind,
                           SmallVectorImpl<ProtocolDecl *> *protocols,
                           SmallVectorImpl<ProtocolConformance *> *conformances,
@@ -463,13 +445,11 @@ public:
   /// Retrieve the complete set of protocols to which this nominal
   /// type conforms.
   void getAllProtocols(NominalTypeDecl *nominal,
-                       LazyResolver *resolver,
                        SmallVectorImpl<ProtocolDecl *> &scratch);
 
   /// Retrieve the complete set of protocol conformances for this
   /// nominal type.
   void getAllConformances(NominalTypeDecl *nominal,
-                          LazyResolver *resolver,
                           bool sorted,
                           SmallVectorImpl<ProtocolConformance *> &scratch);
 
@@ -484,7 +464,6 @@ public:
   ArrayRef<ValueDecl *>
   getSatisfiedProtocolRequirementsForMember(const ValueDecl *member,
                                             NominalTypeDecl *nominal,
-                                            LazyResolver *resolver,
                                             bool sorted);
 
   // Only allow allocation of conformance lookup tables using the
@@ -497,9 +476,7 @@ public:
     return Mem;
   }
 
-  LLVM_ATTRIBUTE_DEPRECATED(
-      void dump() const LLVM_ATTRIBUTE_USED,
-      "only for use within the debugger");
+  SWIFT_DEBUG_DUMP;
   void dump(raw_ostream &os) const;
 
   /// Compare two protocol conformances to place them in some canonical order.

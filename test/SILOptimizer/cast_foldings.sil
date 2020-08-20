@@ -1,4 +1,4 @@
-// RUN: %target-sil-opt -assume-parsing-unqualified-ownership-sil -enable-sil-verify-all -sil-combine %s | %FileCheck %s
+// RUN: %target-sil-opt -enable-objc-interop -enable-sil-verify-all -sil-combine %s | %FileCheck %s
 
 import Swift
 
@@ -12,21 +12,21 @@ struct S {}
 @objc class NSCloud {}
 
 // CHECK-LABEL: sil @dont_fold_unconditional_checked_cast_to_existentials
-// CHECK: unconditional_checked_cast %1 : $NSCloud to $AnyObject
+// CHECK: unconditional_checked_cast %1 : $NSCloud to AnyObject
 sil @dont_fold_unconditional_checked_cast_to_existentials : $@convention(thin) () -> AnyObject {
 entry:
   %0 = alloc_stack $NSCloud
   %1 = load %0 : $*NSCloud
-  %2 = unconditional_checked_cast %1 : $NSCloud to $AnyObject
+  %2 = unconditional_checked_cast %1 : $NSCloud to AnyObject
   dealloc_stack %0 : $*NSCloud
   return %2 : $AnyObject
 }
 
 // CHECK-LABEL: sil @dont_fold_unconditional_checked_cast_from_existentials
-// CHECK: unconditional_checked_cast %0 : $AnyObject to $NSCloud
+// CHECK: unconditional_checked_cast %0 : $AnyObject to NSCloud
 sil @dont_fold_unconditional_checked_cast_from_existentials : $@convention(thin) (AnyObject) -> NSCloud {
 entry (%0 : $AnyObject):
-  %1 = unconditional_checked_cast %0 : $AnyObject to $NSCloud
+  %1 = unconditional_checked_cast %0 : $AnyObject to NSCloud
   return %1 : $NSCloud
 }
 
@@ -139,3 +139,13 @@ bb0(%0 : $*AnyObject):
   return %r : $()
 }
 
+// CHECK-LABEL: sil @testIOU
+// CHECK: bb0(%0 : $*Optional<AnyObject>, %1 : $*Optional<AnyObject>):
+// CHECK:  [[TMP:%.*]] = load %1 : $*Optional<AnyObject>
+// CHECK:  store [[TMP]] to %0 : $*Optional<AnyObject>
+sil @testIOU : $@convention(thin) (@in Optional<AnyObject>) -> (@out Optional<AnyObject>) {
+bb0(%0 : $*Optional<AnyObject>, %1: $*Optional<AnyObject>):
+  unconditional_checked_cast_addr ImplicitlyUnwrappedOptional<AnyObject> in %1 : $*Optional<AnyObject> to Optional<AnyObject> in %0 : $*Optional<AnyObject>
+  %2 = tuple ()
+  return %2 : $()
+}

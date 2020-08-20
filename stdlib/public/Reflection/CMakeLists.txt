@@ -1,16 +1,14 @@
-add_swift_library(swiftReflection STATIC TARGET_LIBRARY FORCE_BUILD_FOR_HOST_SDK
+set(swiftReflection_SOURCES
   MetadataSource.cpp
   TypeLowering.cpp
   TypeRef.cpp
-  TypeRefBuilder.cpp
-  "${SWIFT_SOURCE_DIR}/lib/Demangling/Context.cpp"
-  "${SWIFT_SOURCE_DIR}/lib/Demangling/OldDemangler.cpp"
-  "${SWIFT_SOURCE_DIR}/lib/Demangling/Demangler.cpp"
-  "${SWIFT_SOURCE_DIR}/lib/Demangling/NodePrinter.cpp"
-  "${SWIFT_SOURCE_DIR}/lib/Demangling/ManglingUtils.cpp"
-  "${SWIFT_SOURCE_DIR}/lib/Demangling/Punycode.cpp"
-  "${SWIFT_SOURCE_DIR}/lib/Demangling/Remangler.cpp"
+  TypeRefBuilder.cpp)
 
-  C_COMPILE_FLAGS ${SWIFT_RUNTIME_CXX_FLAGS}
+add_swift_target_library(swiftReflection STATIC
+  ${swiftReflection_SOURCES}
+  C_COMPILE_FLAGS ${SWIFT_RUNTIME_CXX_FLAGS} -DswiftCore_EXPORTS
   LINK_FLAGS ${SWIFT_RUNTIME_LINK_FLAGS}
+  INCORPORATE_OBJECT_LIBRARIES
+    swiftLLVMSupport swiftDemangling
+  SWIFT_COMPILE_FLAGS ${SWIFT_STANDARD_LIBRARY_SWIFT_FLAGS}
   INSTALL_IN_COMPONENT dev)

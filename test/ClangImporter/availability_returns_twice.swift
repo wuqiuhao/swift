@@ -1,11 +1,18 @@
-// RUN: %target-swift-frontend -typecheck -verify %s
+// RUN: %target-typecheck-verify-swift
+// UNSUPPORTED: OS=windows-msvc
+// In Android jmp_buf is int[16], which doesn't convert to &Int (SR-9136)
+// XFAIL: OS=linux-androideabi
+// XFAIL: OS=linux-android
+// XFAIL: OS=openbsd
 
-#if os(OSX) || os(iOS) || os(watchOS) || os(tvOS)
+#if canImport(Darwin)
   import Darwin
   typealias JumpBuffer = Int32
-#else
+#elseif canImport(Glibc)
   import Glibc
   typealias JumpBuffer = jmp_buf
+#else
+#error("Unsupported platform")
 #endif
 
 func test_unavailable_returns_twice_function() {

@@ -13,10 +13,12 @@
 #define DEBUG_TYPE "sil-outliner"
 
 #include "swift/AST/ASTMangler.h"
+#include "swift/AST/Module.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/Types.h"
 #include "swift/Demangling/Demangler.h"
 #include "swift/Demangling/ManglingMacros.h"
+#include "swift/SIL/ApplySite.h"
 #include "swift/SIL/DebugUtils.h"
 #include "swift/SIL/DynamicCasts.h"
 #include "swift/SIL/SILArgument.h"
@@ -26,6 +28,7 @@
 #include "swift/SIL/SILModule.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
+#include "swift/SILOptimizer/Utils/SILOptFunctionBuilder.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
@@ -48,6 +51,7 @@ class OutlinerMangler : public Mangle::ASTMangler {
   };
 
   llvm::BitVector *IsParameterBridged;
+  llvm::BitVector *IsParameterGuaranteed;
   SILDeclRef MethodDecl;
   MethodKind Kind;
   bool IsReturnBridged;
@@ -55,13 +59,15 @@ class OutlinerMangler : public Mangle::ASTMangler {
 public:
   /// Create an mangler for an outlined bridged method.
   OutlinerMangler(SILDeclRef Method, llvm::BitVector *ParameterBridged,
-                  bool ReturnBridged)
-      : IsParameterBridged(ParameterBridged), MethodDecl(Method),
+                  llvm::BitVector *IsParameterGuaranteed, bool ReturnBridged)
+      : IsParameterBridged(ParameterBridged),
+        IsParameterGuaranteed(IsParameterGuaranteed), MethodDecl(Method),
         Kind(BridgedMethod), IsReturnBridged(ReturnBridged) {}
 
   /// Create an mangler for an outlined bridged property.
   OutlinerMangler(SILDeclRef Method, bool IsAddress)
-      : IsParameterBridged(nullptr), MethodDecl(Method),
+      : IsParameterBridged(nullptr), IsParameterGuaranteed(nullptr),
+        MethodDecl(Method),
         Kind(IsAddress ? BridgedPropertyAddress : BridgedProperty),
         IsReturnBridged(true) {}
 
@@ -77,6 +83,7 @@ private:
     case BridgedMethod:
       return 'm';
     }
+    llvm_unreachable("unhandled kind");
   }
 };
 } // end anonymous namespace.
@@ -90,9 +97,14 @@ std::string OutlinerMangler::mangle() {
   llvm::raw_svector_ostream Out(Buffer);
 
   Out << getMethodKindMangling();
-  if (IsParameterBridged)
-    for (unsigned Idx = 0,  E = IsParameterBridged->size(); Idx != E; ++Idx)
+  if (IsParameterBridged) {
+    for (unsigned Idx = 0, E = IsParameterBridged->size(); Idx != E; ++Idx) {
       Out << (IsParameterBridged->test(Idx) ? 'b' : 'n');
+      // NOTE: We must keep owned as having nothing here to preserve ABI since
+      // mangling is part of ABI.
+      Out << (IsParameterGuaranteed->test(Idx) ? "g" : "");
+    }
+  }
   Out << (IsReturnBridged ? 'b' : 'n');
   Out << '_';
 
@@ -101,8 +113,13 @@ std::string OutlinerMangler::mangle() {
 }
 
 namespace {
+
 class OutlinePattern {
+protected:
+  SILOptFunctionBuilder &FuncBuilder;
+
 public:
+  OutlinePattern(SILOptFunctionBuilder &FuncBuilder) : FuncBuilder(FuncBuilder) {}
 
   /// Match the instruction sequence.
   virtual bool matchInstSequence(SILBasicBlock::iterator I) = 0;
@@ -130,24 +147,18 @@ static SILDeclRef getBridgeToObjectiveC(CanType NativeType,
     return SILDeclRef();
   auto ConformanceRef =
       SwiftModule->lookupConformance(NativeType, Proto);
-  if (!ConformanceRef)
+  if (ConformanceRef.isInvalid())
     return SILDeclRef();
 
-  auto Conformance = ConformanceRef->getConcrete();
-  FuncDecl *Requirement = nullptr;
+  auto Conformance = ConformanceRef.getConcrete();
   // bridgeToObjectiveC
   DeclName Name(Ctx, Ctx.Id_bridgeToObjectiveC, llvm::ArrayRef<Identifier>());
-  for (auto Member : Proto->lookupDirect(Name, true)) {
-    if (auto Func = dyn_cast<FuncDecl>(Member)) {
-      Requirement = Func;
-      break;
-    }
-  }
-  assert(Requirement);
+  auto *Requirement = dyn_cast_or_null<FuncDecl>(
+    Proto->getSingleRequirement(Name));
   if (!Requirement)
     return SILDeclRef();
 
-  auto Witness = Conformance->getWitnessDecl(Requirement, nullptr);
+  auto Witness = Conformance->getWitnessDecl(Requirement);
   return SILDeclRef(Witness);
 }
 
@@ -160,44 +171,45 @@ SILDeclRef getBridgeFromObjectiveC(CanType NativeType,
     return SILDeclRef();
   auto ConformanceRef =
       SwiftModule->lookupConformance(NativeType, Proto);
-  if (!ConformanceRef)
+  if (ConformanceRef.isInvalid())
     return SILDeclRef();
-  auto Conformance = ConformanceRef->getConcrete();
-  FuncDecl *Requirement = nullptr;
+  auto Conformance = ConformanceRef.getConcrete();
   // _unconditionallyBridgeFromObjectiveC
   DeclName Name(Ctx, Ctx.getIdentifier("_unconditionallyBridgeFromObjectiveC"),
                 llvm::makeArrayRef(Identifier()));
-  for (auto Member : Proto->lookupDirect(Name, true)) {
-    if (auto Func = dyn_cast<FuncDecl>(Member)) {
-      Requirement = Func;
-      break;
-    }
-  }
-  assert(Requirement);
+  auto *Requirement = dyn_cast_or_null<FuncDecl>(
+      Proto->getSingleRequirement(Name));
   if (!Requirement)
     return SILDeclRef();
 
-  auto Witness = Conformance->getWitnessDecl(Requirement, nullptr);
+  auto Witness = Conformance->getWitnessDecl(Requirement);
   return SILDeclRef(Witness);
 }
+
+struct SwitchInfo {
+  SwitchEnumInst *SwitchEnum = nullptr;
+  SILBasicBlock *SomeBB = nullptr;
+  SILBasicBlock *NoneBB = nullptr;
+  BranchInst *Br = nullptr;
+};
 
 /// Pattern for a bridged property call.
 ///
 ///  bb7:
-///    %30 = unchecked_take_enum_data_addr %19 : $*Optional<UITextField>, #Optional.some!enumelt.1
+///    %30 = unchecked_take_enum_data_addr %19 : $*Optional<UITextField>, #Optional.some!enumelt
 ///    %31 = load %30 : $*UITextField
 ///    strong_retain %31 : $UITextField
-///    %33 = objc_method %31 : $UITextField, #UITextField.text!getter.1.foreign : (UITextField) -> () -> String?, $@convention(objc_method) (UITextField) -> @autoreleased Optional<NSString>
+///    %33 = objc_method %31 : $UITextField, #UITextField.text!getter.foreign : (UITextField) -> () -> String?, $@convention(objc_method) (UITextField) -> @autoreleased Optional<NSString>
 ///    %34 = apply %33(%31) : $@convention(objc_method) (UITextField) -> @autoreleased Optional<NSString>
-///    switch_enum %34 : $Optional<NSString>, case #Optional.some!enumelt.1: bb8, case #Optional.none!enumelt: bb9
+///    switch_enum %34 : $Optional<NSString>, case #Optional.some!enumelt: bb8, case #Optional.none!enumelt: bb9
 ///
 ///  bb8(%36 : $NSString):
 ///    // function_ref static String._unconditionallyBridgeFromObjectiveC(_:)
-///    %37 = function_ref @_T0SS10FoundationE36_unconditionallyBridgeFromObjectiveCSSSo8NSStringCSgFZ : $@convention(method) (@owned Optional<NSString>, @thin String.Type) -> @owned String
-///    %38 = enum $Optional<NSString>, #Optional.some!enumelt.1, %36 : $NSString
+///    %37 = function_ref @$SSS10FoundationE36_unconditionallyBridgeFromObjectiveCSSSo8NSStringCSgFZ : $@convention(method) (@owned Optional<NSString>, @thin String.Type) -> @owned String
+///    %38 = enum $Optional<NSString>, #Optional.some!enumelt, %36 : $NSString
 ///    %39 = metatype $@thin String.Type
 ///    %40 = apply %37(%38, %39) : $@convention(method) (@owned Optional<NSString>, @thin String.Type) -> @owned String
-///    %41 = enum $Optional<String>, #Optional.some!enumelt.1, %40 : $String
+///    %41 = enum $Optional<String>, #Optional.some!enumelt, %40 : $String
 ///    br bb10(%41 : $Optional<String>)
 ///
 ///  bb9:
@@ -209,10 +221,8 @@ class BridgedProperty : public OutlinePattern {
   std::string OutlinedName;
   SingleValueInstruction *FirstInst; // A load or class_method
   SILBasicBlock *StartBB;
-  SILBasicBlock *SomeBB;
-  SILBasicBlock *NoneBB;
-  BranchInst *Br;
-  ObjCMethodInst *ObjCMethod;;
+  SwitchInfo switchInfo;
+  ObjCMethodInst *ObjCMethod;
   StrongReleaseInst *Release;
   ApplyInst *PropApply;
 
@@ -222,7 +232,7 @@ public:
   std::pair<SILFunction *, SILBasicBlock::iterator>
   outline(SILModule &M) override;
 
-  BridgedProperty() {
+  BridgedProperty(SILOptFunctionBuilder &FuncBuilder) : OutlinePattern(FuncBuilder) {
     clearState();
   }
 
@@ -243,9 +253,7 @@ private:
 void BridgedProperty::clearState() {
     FirstInst = nullptr;
     StartBB = nullptr;
-    SomeBB = nullptr;
-    NoneBB = nullptr;
-    Br = nullptr;
+    switchInfo = SwitchInfo();
     ObjCMethod = nullptr;
     Release = nullptr;
     PropApply = nullptr;
@@ -274,25 +282,31 @@ CanSILFunctionType BridgedProperty::getOutlinedFunctionType(SILModule &M) {
   SmallVector<SILParameterInfo, 4> Parameters;
   if (auto *Load = dyn_cast<LoadInst>(FirstInst))
     Parameters.push_back(
-      SILParameterInfo(Load->getType().getSwiftRValueType(),
+      SILParameterInfo(Load->getType().getASTType(),
                        ParameterConvention::Indirect_In_Guaranteed));
   else
     Parameters.push_back(SILParameterInfo(cast<ObjCMethodInst>(FirstInst)
                                               ->getOperand()
                                               ->getType()
-                                              .getSwiftRValueType(),
+                                              .getASTType(),
                                           ParameterConvention::Direct_Unowned));
   SmallVector<SILResultInfo, 4> Results;
 
-  Results.push_back(SILResultInfo(Br->getArg(0)->getType().getSwiftRValueType(),
-                                  ResultConvention::Owned));
-  auto ExtInfo =
-      SILFunctionType::ExtInfo(SILFunctionType::Representation::Thin,
-                               /*pseudogeneric*/ false, /*noescape*/ false);
+  Results.push_back(SILResultInfo(
+                      switchInfo.Br->getArg(0)->getType().getASTType(),
+                      ResultConvention::Owned));
+  auto ExtInfo = SILFunctionType::ExtInfoBuilder(
+                     SILFunctionType::Representation::Thin,
+                     /*pseudogeneric*/ false, /*noescape*/ false,
+                     DifferentiabilityKind::NonDifferentiable,
+                     /*clangFunctionType*/ nullptr)
+                     .build();
   auto FunctionType = SILFunctionType::get(
-      nullptr, ExtInfo, SILCoroutineKind::None,
+      nullptr, ExtInfo, /*isAsync*/ false, SILCoroutineKind::None,
       ParameterConvention::Direct_Unowned, Parameters, /*yields*/ {},
-      Results, None, M.getASTContext());
+      Results, None,
+      SubstitutionMap(), SubstitutionMap(),
+      M.getASTContext());
   return FunctionType;
 }
 
@@ -301,11 +315,12 @@ BridgedProperty::outline(SILModule &M) {
   // Get the function type.
   auto FunctionType = getOutlinedFunctionType(M);
 
-  std::string name = getOutlinedFunctionName();
+  std::string nameTmp = getOutlinedFunctionName();
+  auto name = M.allocateCopy(nameTmp);
 
-  auto *Fun = M.getOrCreateFunction(ObjCMethod->getLoc(), name,
-                                    SILLinkage::Shared, FunctionType, IsNotBare,
-                                    IsNotTransparent, IsSerializable);
+  auto *Fun = FuncBuilder.getOrCreateFunction(
+      ObjCMethod->getLoc(), name, SILLinkage::Shared, FunctionType, IsNotBare,
+      IsNotTransparent, IsSerializable, IsNotDynamic);
   bool NeedsDefinition = Fun->empty();
 
   if (Release) {
@@ -332,7 +347,7 @@ BridgedProperty::outline(SILModule &M) {
   //   [NewTailBB]
   //
   auto *OutlinedEntryBB = StartBB->split(SILBasicBlock::iterator(FirstInst));
-  auto *OldMergeBB = Br->getDestBB();
+  auto *OldMergeBB = switchInfo.Br->getDestBB();
   auto *NewTailBB = OldMergeBB->split(OldMergeBB->begin());
 
   // Call the outlined function.
@@ -341,7 +356,8 @@ BridgedProperty::outline(SILModule &M) {
     auto Loc = FirstInst->getLoc();
     SILValue FunRef(Builder.createFunctionRef(Loc, Fun));
     SILValue Apply(
-        Builder.createApply(Loc, FunRef, {FirstInst->getOperand(0)}, false));
+        Builder.createApply(Loc, FunRef, SubstitutionMap(),
+                            {FirstInst->getOperand(0)}));
     Builder.createBranch(Loc, NewTailBB);
     OldMergeBB->getArgument(0)->replaceAllUsesWith(Apply);
   }
@@ -352,25 +368,25 @@ BridgedProperty::outline(SILModule &M) {
       Release->eraseFromParent();
     OutlinedEntryBB->eraseInstructions();
     OutlinedEntryBB->eraseFromParent();
-    NoneBB->eraseInstructions();
-    NoneBB->eraseFromParent();
-    SomeBB->eraseInstructions();
-    SomeBB->eraseFromParent();
+    switchInfo.NoneBB->eraseInstructions();
+    switchInfo.NoneBB->eraseFromParent();
+    switchInfo.SomeBB->eraseInstructions();
+    switchInfo.SomeBB->eraseFromParent();
     OldMergeBB->eraseInstructions();
     OldMergeBB->eraseFromParent();
     return std::make_pair(nullptr, std::prev(StartBB->end()));
   }
 
-  if (OutlinedEntryBB->getParent()->hasUnqualifiedOwnership())
-    Fun->setUnqualifiedOwnership();
+  if (!OutlinedEntryBB->getParent()->hasOwnership())
+    Fun->setOwnershipEliminated();
 
   Fun->setInlineStrategy(NoInline);
 
   // Move the blocks into the new function.
   auto &FromBlockList = OutlinedEntryBB->getParent()->getBlocks();
   Fun->getBlocks().splice(Fun->begin(), FromBlockList, OldMergeBB);
-  Fun->getBlocks().splice(Fun->begin(), FromBlockList, NoneBB);
-  Fun->getBlocks().splice(Fun->begin(), FromBlockList, SomeBB);
+  Fun->getBlocks().splice(Fun->begin(), FromBlockList, switchInfo.NoneBB);
+  Fun->getBlocks().splice(Fun->begin(), FromBlockList, switchInfo.SomeBB);
   Fun->getBlocks().splice(Fun->begin(), FromBlockList, OutlinedEntryBB);
 
   // Create the function argument and return.
@@ -401,18 +417,129 @@ BridgedProperty::outline(SILModule &M) {
       return false;                                                            \
   } while (0);
 
+static bool matchSwitch(SwitchInfo &SI, SILInstruction *Inst,
+                        SILValue SwitchOperand) {
+  auto *SwitchEnum = dyn_cast<SwitchEnumInst>(Inst);
+  if (!SwitchEnum || SwitchEnum->getNumCases() != 2 ||
+      SwitchEnum->getOperand() != SwitchOperand)
+    return false;
+
+  auto *SwitchBB = SwitchEnum->getParent();
+  SILBasicBlock *SomeBB = SwitchEnum->getCase(0).second;
+  SILBasicBlock *NoneBB = SwitchEnum->getCase(1).second;
+  if (NoneBB->getSinglePredecessorBlock() != SwitchBB)
+    return false;
+  if (SomeBB->getSinglePredecessorBlock() != SwitchBB)
+    return false;
+  if (NoneBB->args_size() == 1)
+    std::swap(NoneBB, SomeBB);
+  if (SomeBB->args_size() != 1 || NoneBB->args_size() != 0)
+    return false;
+
+  // bb9:
+  // %43 = enum $Optional<String>, #Optional.none!enumelt
+  auto It = NoneBB->begin();
+  auto *NoneEnum = dyn_cast<EnumInst>(It);
+  if (!NoneEnum || NoneEnum->hasOperand() || !NoneEnum->hasOneUse())
+    return false;
+
+  // br bb10(%43 : $Optional<String>)
+  ADVANCE_ITERATOR_OR_RETURN_FALSE(It);
+  auto *Br1 = dyn_cast<BranchInst>(It);
+  if (!Br1 || Br1->getNumArgs() != 1 || Br1->getArg(0) != NoneEnum)
+    return false;
+  auto *MergeBB = Br1->getDestBB();
+
+  // bb8(%36 : $NSString):
+  It = SomeBB->begin();
+  auto *SomeBBArg = SomeBB->getArgument(0);
+  if (!SomeBBArg->hasOneUse())
+    return false;
+
+  // %37 = function_ref @$SSS10FoundationE36_unconditionallyBridgeFromObjectiveCSSSo8NSStringCSgFZ : $@convention(method) (@owned Optional<NSString>, @thin String.Type) -> @owned String
+  auto *FunRef = dyn_cast<FunctionRefInst>(It);
+  if (!FunRef || !FunRef->hasOneUse())
+    return false;
+
+  // %38 = enum $Optional<NSString>, #Optional.some!enumelt, %36 : $NSString
+  ADVANCE_ITERATOR_OR_RETURN_FALSE(It);
+  auto *SomeEnum = dyn_cast<EnumInst>(It);
+  if (!SomeEnum || !SomeEnum->hasOperand() || SomeEnum->getOperand() != SomeBBArg)
+    return false;
+  size_t numSomeEnumUses = std::distance(SomeEnum->use_begin(), SomeEnum->use_end());
+  if (numSomeEnumUses > 2)
+    return false;
+
+  // %39 = metatype $@thin String.Type
+  ADVANCE_ITERATOR_OR_RETURN_FALSE(It);
+  auto *Metatype = dyn_cast<MetatypeInst>(It);
+  if (!Metatype || !Metatype->hasOneUse())
+    return false;
+
+  // %40 = apply %37(%38, %39) : $@convention(method) (@owned Optional<NSString>, @thin String.Type) -> @owned String
+  ADVANCE_ITERATOR_OR_RETURN_FALSE(It);
+  auto *Apply = dyn_cast<ApplyInst>(It);
+  if (!Apply || !Apply->hasOneUse() || Apply->getCallee() != FunRef ||
+      Apply->getNumArguments() != 2 || Apply->getArgument(0) != SomeEnum ||
+      Apply->getArgument(1) != Metatype ||
+      Apply->getSubstCalleeType()->getNumResults() != 1)
+    return false;
+  if (Apply->getSubstCalleeType()->getSingleResult().getConvention() !=
+      ResultConvention::Owned)
+    return false;
+
+  // Check that we call the _unconditionallyBridgeFromObjectiveC witness.
+  auto NativeType = Apply->getType().getASTType();
+  auto *BridgeFun = FunRef->getInitiallyReferencedFunction();
+  auto *SwiftModule = BridgeFun->getModule().getSwiftModule();
+  // Not every type conforms to the ObjectiveCBridgeable protocol in such a case
+  // getBridgeFromObjectiveC returns SILDeclRef().
+  auto bridgeWitness = getBridgeFromObjectiveC(NativeType, SwiftModule);
+  if (bridgeWitness == SILDeclRef() ||
+      BridgeFun->getName() != bridgeWitness.mangle())
+    return false;
+
+  // %41 = enum $Optional<String>, #Optional.some!enumelt, %40 : $String
+  ADVANCE_ITERATOR_OR_RETURN_FALSE(It);
+  auto *Enum3 = dyn_cast<EnumInst>(It);
+  if (!Enum3 || !Enum3->hasOneUse() || !Enum3->hasOperand() ||
+      Enum3->getOperand() != Apply)
+    return false;
+
+  if (numSomeEnumUses == 2) {
+    // release_value %38 : $Optional<NSString>
+    ADVANCE_ITERATOR_OR_RETURN_FALSE(It);
+    auto *RVI = dyn_cast<ReleaseValueInst>(It);
+    if (!RVI || RVI->getOperand() != SomeEnum)
+      return false;
+  }
+
+  // br bb10(%41 : $Optional<String>)
+  ADVANCE_ITERATOR_OR_RETURN_FALSE(It);
+  auto *Br = dyn_cast<BranchInst>(It);
+  if (!Br || Br->getDestBB() != MergeBB || Br->getNumArgs() != 1 ||
+      Br->getArg(0) != Enum3)
+    return false;
+
+  SI.SwitchEnum = SwitchEnum;
+  SI.SomeBB = SomeBB;
+  SI.NoneBB = NoneBB;
+  SI.Br = Br;
+  return true;
+}
+
 bool BridgedProperty::matchMethodCall(SILBasicBlock::iterator It) {
   // Matches:
-  //    %33 = objc_method %31 : $UITextField, #UITextField.text!getter.1.foreign : (UITextField) -> () -> String?, $@convention(objc_method) (UITextField) -> @autoreleased Optional<NSString>
+  //    %33 = objc_method %31 : $UITextField, #UITextField.text!getter.foreign : (UITextField) -> () -> String?, $@convention(objc_method) (UITextField) -> @autoreleased Optional<NSString>
   //    %34 = apply %33(%31) : $@convention(objc_method) (UITextField) -> @autoreleased Optional<NSString>
-  //    switch_enum %34 : $Optional<NSString>, case #Optional.some!enumelt.1: bb8, case #Optional.none!enumelt: bb9
+  //    switch_enum %34 : $Optional<NSString>, case #Optional.some!enumelt: bb8, case #Optional.none!enumelt: bb9
   //
   //  bb8(%36 : $NSString):
-  //    %37 = function_ref @_T0SS10FoundationE36_unconditionallyBridgeFromObjectiveCSSSo8NSStringCSgFZ : $@convention(method) (@owned Optional<NSString>, @thin String.Type) -> @owned String
-  //    %38 = enum $Optional<NSString>, #Optional.some!enumelt.1, %36 : $NSString
+  //    %37 = function_ref @$SSS10FoundationE36_unconditionallyBridgeFromObjectiveCSSSo8NSStringCSgFZ : $@convention(method) (@owned Optional<NSString>, @thin String.Type) -> @owned String
+  //    %38 = enum $Optional<NSString>, #Optional.some!enumelt, %36 : $NSString
   //    %39 = metatype $@thin String.Type
   //    %40 = apply %37(%38, %39) : $@convention(method) (@owned Optional<NSString>, @thin String.Type) -> @owned String
-  //    %41 = enum $Optional<String>, #Optional.some!enumelt.1, %40 : $String
+  //    %41 = enum $Optional<String>, #Optional.some!enumelt, %40 : $String
   //    br bb10(%41 : $Optional<String>)
   //
   //  bb9:
@@ -422,12 +549,15 @@ bool BridgedProperty::matchMethodCall(SILBasicBlock::iterator It) {
   //  bb10(%45 : $Optional<String>):
   //
 
-  // %33 = objc_method %31 : $UITextField, #UITextField.text!getter.1.foreign
+  // %33 = objc_method %31 : $UITextField, #UITextField.text!getter.foreign
   ObjCMethod = dyn_cast<ObjCMethodInst>(It);
   SILValue Instance =
       FirstInst != ObjCMethod ? FirstInst : ObjCMethod->getOperand();
   if (!ObjCMethod || !ObjCMethod->hasOneUse() ||
-      ObjCMethod->getOperand() != Instance)
+      ObjCMethod->getOperand() != Instance ||
+      ObjCMethod->getFunction()->getLoweredFunctionType()->isPolymorphic() ||
+      ObjCMethod->getType().castTo<SILFunctionType>()->isPolymorphic() ||
+      ObjCMethod->getType().castTo<SILFunctionType>()->hasOpenedExistential())
     return false;
 
   // Don't outline in the outlined function.
@@ -442,97 +572,9 @@ bool BridgedProperty::matchMethodCall(SILBasicBlock::iterator It) {
       PropApply->getArgument(0) != Instance || !PropApply->hasOneUse())
     return false;
 
-  // switch_enum %34 : $Optional<NSString>, case #Optional.some!enumelt.1: bb8, case #Optional.none!enumelt: bb9
+  // switch_enum %34 : $Optional<NSString>, case #Optional.some!enumelt: bb8, case #Optional.none!enumelt: bb9
   ADVANCE_ITERATOR_OR_RETURN_FALSE(It);
-  auto *SwitchEnum = dyn_cast<SwitchEnumInst>(It);
-  if (!SwitchEnum || SwitchEnum->getNumCases() != 2 ||
-      SwitchEnum->getOperand() != PropApply)
-    return false;
-
-  auto *SwitchBB = FirstInst->getParent();
-  SomeBB = SwitchEnum->getCase(0).second;
-  NoneBB = SwitchEnum->getCase(1).second;
-  if (NoneBB->getSinglePredecessorBlock() != SwitchBB)
-    return false;
-  if (SomeBB->getSinglePredecessorBlock() != SwitchBB)
-    return false;
-  if (NoneBB->args_size() == 1)
-    std::swap(NoneBB, SomeBB);
-  if (SomeBB->args_size() != 1 || NoneBB->args_size() != 0)
-    return false;
-
-  // bb9:
-  // %43 = enum $Optional<String>, #Optional.none!enumelt
-  It = NoneBB->begin();
-  auto *Enum = dyn_cast<EnumInst>(It);
-  if (!Enum || Enum->hasOperand() || !Enum->hasOneUse())
-    return false;
-
-  // br bb10(%43 : $Optional<String>)
-  ADVANCE_ITERATOR_OR_RETURN_FALSE(It);
-  Br = dyn_cast<BranchInst>(It);
-  if (!Br || Br->getNumArgs() != 1 || Br->getArg(0) != Enum)
-    return false;
-  auto *MergeBB = Br->getDestBB();
-
-  // bb8(%36 : $NSString):
-  It = SomeBB->begin();
-  auto *SomeBBArg = SomeBB->getArgument(0);
-  if (!SomeBBArg->hasOneUse())
-    return false;
-
-  // %37 = function_ref @_T0SS10FoundationE36_unconditionallyBridgeFromObjectiveCSSSo8NSStringCSgFZ : $@convention(method) (@owned Optional<NSString>, @thin String.Type) -> @owned String
-  auto *FunRef = dyn_cast<FunctionRefInst>(It);
-  if (!FunRef || !FunRef->hasOneUse())
-    return false;
-
-  // %38 = enum $Optional<NSString>, #Optional.some!enumelt.1, %36 : $NSString
-  ADVANCE_ITERATOR_OR_RETURN_FALSE(It);
-  Enum = dyn_cast<EnumInst>(It);
-  if (!Enum || !Enum->hasOperand() || Enum->getOperand() != SomeBBArg ||
-      !Enum->hasOneUse())
-    return false;
-
-  // %39 = metatype $@thin String.Type
-  ADVANCE_ITERATOR_OR_RETURN_FALSE(It);
-  auto *Metatype = dyn_cast<MetatypeInst>(It);
-  if (!Metatype || !Metatype->hasOneUse())
-    return false;
-
-  // %40 = apply %37(%38, %39) : $@convention(method) (@owned Optional<NSString>, @thin String.Type) -> @owned String
-  ADVANCE_ITERATOR_OR_RETURN_FALSE(It);
-  auto *Apply = dyn_cast<ApplyInst>(It);
-  if (!Apply || !Apply->hasOneUse() || Apply->getCallee() != FunRef ||
-      Apply->getNumArguments() != 2 || Apply->getArgument(0) != Enum ||
-      Apply->getArgument(1) != Metatype ||
-      Apply->getSubstCalleeType()->getNumResults() != 1)
-    return false;
-  if (Apply->getSubstCalleeType()->getSingleResult().getConvention() !=
-      ResultConvention::Owned)
-    return false;
-
-  // Check that we call the _unconditionallyBridgeFromObjectiveC witness.
-  auto NativeType = Apply->getType().getSwiftRValueType();
-  auto *BridgeFun = FunRef->getReferencedFunction();
-  auto *SwiftModule = BridgeFun->getModule().getSwiftModule();
-  auto bridgeWitness = getBridgeFromObjectiveC(NativeType, SwiftModule);
-  if (BridgeFun->getName() != bridgeWitness.mangle())
-    return false;
-
-  // %41 = enum $Optional<String>, #Optional.some!enumelt.1, %40 : $String
-  ADVANCE_ITERATOR_OR_RETURN_FALSE(It);
-  Enum = dyn_cast<EnumInst>(It);
-  if (!Enum || !Enum->hasOneUse() || !Enum->hasOperand() ||
-      Enum->getOperand() != Apply)
-    return false;
-
-  // br bb10(%41 : $Optional<String>)
-  ADVANCE_ITERATOR_OR_RETURN_FALSE(It);
-  Br = dyn_cast<BranchInst>(It);
-  if (!Br || Br->getDestBB() != MergeBB || Br->getNumArgs() != 1 ||
-      Br->getArg(0) != Enum)
-    return false;
-  return true;
+  return matchSwitch(switchInfo, &*It, PropApply);
 }
 
 bool BridgedProperty::matchInstSequence(SILBasicBlock::iterator It) {
@@ -541,16 +583,16 @@ bool BridgedProperty::matchInstSequence(SILBasicBlock::iterator It) {
   //    %31 = load %30 : $*UITextField
   //    strong_retain %31 : $UITextField
   // ]
-  //    %33 = objc_method %31 : $UITextField, #UITextField.text!getter.1.foreign : (UITextField) -> () -> String?, $@convention(objc_method) (UITextField) -> @autoreleased Optional<NSString>
+  //    %33 = objc_method %31 : $UITextField, #UITextField.text!getter.foreign : (UITextField) -> () -> String?, $@convention(objc_method) (UITextField) -> @autoreleased Optional<NSString>
   //    %34 = apply %33(%31) : $@convention(objc_method) (UITextField) -> @autoreleased Optional<NSString>
-  //    switch_enum %34 : $Optional<NSString>, case #Optional.some!enumelt.1: bb8, case #Optional.none!enumelt: bb9
+  //    switch_enum %34 : $Optional<NSString>, case #Optional.some!enumelt: bb8, case #Optional.none!enumelt: bb9
   //
   //  bb8(%36 : $NSString):
-  //    %37 = function_ref @_T0SS10FoundationE36_unconditionallyBridgeFromObjectiveCSSSo8NSStringCSgFZ : $@convention(method) (@owned Optional<NSString>, @thin String.Type) -> @owned String
-  //    %38 = enum $Optional<NSString>, #Optional.some!enumelt.1, %36 : $NSString
+  //    %37 = function_ref @$SSS10FoundationE36_unconditionallyBridgeFromObjectiveCSSSo8NSStringCSgFZ : $@convention(method) (@owned Optional<NSString>, @thin String.Type) -> @owned String
+  //    %38 = enum $Optional<NSString>, #Optional.some!enumelt, %36 : $NSString
   //    %39 = metatype $@thin String.Type
   //    %40 = apply %37(%38, %39) : $@convention(method) (@owned Optional<NSString>, @thin String.Type) -> @owned String
-  //    %41 = enum $Optional<String>, #Optional.some!enumelt.1, %40 : $String
+  //    %41 = enum $Optional<String>, #Optional.some!enumelt, %40 : $String
   //    br bb10(%41 : $Optional<String>)
   //
   //  bb9:
@@ -568,7 +610,9 @@ bool BridgedProperty::matchInstSequence(SILBasicBlock::iterator It) {
   if (!Load) {
     // Try to match without the load/strong_retain prefix.
     auto *CMI = dyn_cast<ObjCMethodInst>(It);
-    if (!CMI)
+    if (!CMI || CMI->getFunction()->getLoweredFunctionType()->isPolymorphic() ||
+        CMI->getType().castTo<SILFunctionType>()->isPolymorphic() ||
+        CMI->getType().castTo<SILFunctionType>()->hasOpenedExistential())
       return false;
     FirstInst = CMI;
   } else
@@ -607,26 +651,33 @@ bool BridgedProperty::matchInstSequence(SILBasicBlock::iterator It) {
     if (!Release || NumUses != 4)
       return false;
   }
-
   return true;
 }
 
 
 namespace {
+
 /// Match a bridged argument.
-/// %15 = function_ref @_T0SS10FoundationE19_bridgeToObjectiveCSo8NSStringCyF
+///
+///
+/// %15 = function_ref @$SSS10FoundationE19_bridgeToObjectiveCSo8NSStringCyF
 /// %16 = apply %15(%14) :
 ///         $@convention(method) (@guaranteed String) -> @owned NSString
-/// %17 = enum $Optional<NSString>, #Optional.some!enumelt.1, %16 : $NSString
+/// %17 = enum $Optional<NSString>, #Optional.some!enumelt, %16 : $NSString
 /// release_value %14 : $String
 ///
 /// apply %objcMethod(%17, ...) : $@convention(objc_method) (Optional<NSString> ...) ->
 /// release_value %17 : $Optional<NSString>
+///
+/// NOTE: If release_value %14 is found, our outlined function will have an
+/// owned convention for self. Otherwise, if we do not find it, we will have a
+/// guaranteed one.
 class BridgedArgument {
 public:
   FunctionRefInst *BridgeFun;
   ApplyInst *BridgeCall;
   EnumInst *OptionalResult;
+  SILValue BridgedValue;
   ReleaseValueInst *ReleaseAfterBridge;
   ReleaseValueInst *ReleaseArgAfterCall;
   unsigned Idx = 0;
@@ -634,8 +685,9 @@ public:
   // Matched bridged argument.
   BridgedArgument(unsigned Idx, FunctionRefInst *F, ApplyInst *A, EnumInst *E,
                   ReleaseValueInst *R0, ReleaseValueInst *R1)
-      : BridgeFun(F), BridgeCall(A), OptionalResult(E), ReleaseAfterBridge(R0),
-        ReleaseArgAfterCall(R1), Idx(Idx) {}
+      : BridgeFun(F), BridgeCall(A), OptionalResult(E),
+        BridgedValue(FullApplySite(A).getSelfArgument()),
+        ReleaseAfterBridge(R0), ReleaseArgAfterCall(R1), Idx(Idx) {}
 
   /// Invalid argument constructor.
   BridgedArgument()
@@ -645,7 +697,14 @@ public:
   static BridgedArgument match(unsigned ArgIdx, SILValue Arg, ApplyInst *AI);
 
   operator bool() const { return BridgeFun != nullptr; }
-  SILValue bridgedValue() { return ReleaseAfterBridge->getOperand(); }
+  SILValue bridgedValue() { return BridgedValue; }
+
+  bool isGuaranteed() const { return ReleaseAfterBridge == nullptr; }
+  ParameterConvention getConvention() const {
+    if (isGuaranteed())
+      return ParameterConvention::Direct_Guaranteed;
+    return ParameterConvention::Direct_Owned;
+  }
 
   void eraseFromParent();
 
@@ -667,27 +726,42 @@ void BridgedArgument::transferTo(SILValue BridgedValue,
   DestBB->moveTo(SILBasicBlock::iterator(BridgedCall), BridgeCall);
   BridgeCall->setArgument(0, BridgedValue);
   DestBB->moveTo(SILBasicBlock::iterator(BridgedCall), OptionalResult);
-  DestBB->moveTo(SILBasicBlock::iterator(BridgedCall), ReleaseAfterBridge);
-  ReleaseAfterBridge->setOperand(BridgedValue);
+  if (ReleaseAfterBridge) {
+    DestBB->moveTo(SILBasicBlock::iterator(BridgedCall), ReleaseAfterBridge);
+    ReleaseAfterBridge->setOperand(BridgedValue);
+  }
   auto AfterCall = std::next(SILBasicBlock::iterator(BridgedCall));
   DestBB->moveTo(SILBasicBlock::iterator(AfterCall), ReleaseArgAfterCall);
 }
 
 void BridgedArgument::eraseFromParent() {
-  ReleaseAfterBridge->eraseFromParent();
+  if (ReleaseAfterBridge)
+    ReleaseAfterBridge->eraseFromParent();
   ReleaseArgAfterCall->eraseFromParent();
   OptionalResult->eraseFromParent();
   BridgeCall->eraseFromParent();
   BridgeFun->eraseFromParent();
 }
 
+static ReleaseValueInst *findReleaseOf(SILValue releasedValue,
+                                       SILBasicBlock::iterator from,
+                                       SILBasicBlock::iterator to) {
+  while (from != to) {
+    auto release = dyn_cast<ReleaseValueInst>(&*from);
+    if (release && release->getOperand() == releasedValue)
+      return release;
+    ++from;
+  }
+  return nullptr;
+}
+
 BridgedArgument BridgedArgument::match(unsigned ArgIdx, SILValue Arg,
                                        ApplyInst *AI) {
   // Match
-  // %15 = function_ref @_T0SS10FoundationE19_bridgeToObjectiveCSo8NSStringCyF
+  // %15 = function_ref @$SSS10FoundationE19_bridgeToObjectiveCSo8NSStringCyF
   // %16 = apply %15(%14) :
   //         $@convention(method) (@guaranteed String) -> @owned NSString
-  // %17 = enum $Optional<NSString>, #Optional.some!enumelt.1, %16 : $NSString
+  // %17 = enum $Optional<NSString>, #Optional.some!enumelt, %16 : $NSString
   // release_value %14 : $String
   // ...
   // apply %objcMethod(%17, ...) : $@convention(objc_method) (Optional<NSString> ...) ->
@@ -695,21 +769,42 @@ BridgedArgument BridgedArgument::match(unsigned ArgIdx, SILValue Arg,
   // release_value %17 : $Optional<NSString>
   //
   auto *Enum = dyn_cast<EnumInst>(Arg);
-  if (!Enum)
+  if (!Enum || !Enum->hasOperand())
     return BridgedArgument();
 
+  if (SILBasicBlock::iterator(Enum) == Enum->getParent()->begin())
+    return BridgedArgument();
   auto *BridgeCall =
       dyn_cast<ApplyInst>(std::prev(SILBasicBlock::iterator(Enum)));
   if (!BridgeCall || BridgeCall->getNumArguments() != 1 ||
-      Enum->getOperand() != BridgeCall || !BridgeCall->hasOneUse())
+      Enum->getOperand() != BridgeCall || !BridgeCall->hasOneUse() ||
+      !FullApplySite(BridgeCall).hasSelfArgument())
+    return BridgedArgument();
+
+  auto &selfArg = FullApplySite(BridgeCall).getSelfArgumentOperand();
+  auto selfConvention =
+      FullApplySite(BridgeCall).getArgumentConvention(selfArg);
+  if (selfConvention != SILArgumentConvention::Direct_Guaranteed &&
+      selfConvention != SILArgumentConvention::Direct_Owned)
     return BridgedArgument();
 
   auto BridgedValue = BridgeCall->getArgument(0);
-  auto *BridgedValueRelease =
-      dyn_cast<ReleaseValueInst>(std::next(SILBasicBlock::iterator(Enum)));
-  if (!BridgedValueRelease || BridgedValueRelease->getOperand() != BridgedValue)
+  auto Next = std::next(SILBasicBlock::iterator(Enum));
+  if (Next == Enum->getParent()->end())
     return BridgedArgument();
 
+  // Make sure that if we have a bridged value release that it is on the bridged
+  // value.
+  if (Enum->getParent() != AI->getParent())
+    return BridgedArgument();
+  auto *BridgedValueRelease = dyn_cast_or_null<ReleaseValueInst>(
+      findReleaseOf(BridgedValue, std::next(SILBasicBlock::iterator(Enum)),
+                    SILBasicBlock::iterator(AI)));
+  if (BridgedValueRelease && BridgedValueRelease->getOperand() != BridgedValue)
+    return BridgedArgument();
+
+  if (SILBasicBlock::iterator(BridgeCall) == BridgeCall->getParent()->begin())
+    return BridgedArgument();
   auto *FunRef =
       dyn_cast<FunctionRefInst>(std::prev(SILBasicBlock::iterator(BridgeCall)));
   if (!FunRef || !FunRef->hasOneUse() || BridgeCall->getCallee() != FunRef)
@@ -730,11 +825,14 @@ BridgedArgument BridgedArgument::match(unsigned ArgIdx, SILValue Arg,
   }
 
   // Make sure we are calling the actual bridge witness.
-  auto NativeType = BridgedValue->getType().getSwiftRValueType();
-  auto *BridgeFun = FunRef->getReferencedFunction();
+  auto NativeType = BridgedValue->getType().getASTType();
+  auto *BridgeFun = FunRef->getInitiallyReferencedFunction();
   auto *SwiftModule = BridgeFun->getModule().getSwiftModule();
+  // Not every type conforms to the ObjectiveCBridgeable protocol in such a case
+  // getBridgeToObjectiveC returns SILDeclRef().
   auto bridgeWitness = getBridgeToObjectiveC(NativeType, SwiftModule);
-  if (BridgeFun->getName() != bridgeWitness.mangle())
+  if (bridgeWitness == SILDeclRef() ||
+      BridgeFun->getName() != bridgeWitness.mangle())
     return BridgedArgument();
 
   return BridgedArgument(ArgIdx, FunRef, BridgeCall, Enum, BridgedValueRelease,
@@ -747,10 +845,10 @@ namespace {
 //
 // bb1(%23 : $NSString):
 //   %24 = function_ref @_unconditionallyBridgeFromObjectiveC
-//   %25 = enum $Optional<NSString>, #Optional.some!enumelt.1, %23 : $NSString
+//   %25 = enum $Optional<NSString>, #Optional.some!enumelt, %23 : $NSString
 //   %26 = metatype $@thin String.Type
 //   %27 = apply %24(%25, %26)
-//   %28 = enum $Optional<String>, #Optional.some!enumelt.1, %27 : $String
+//   %28 = enum $Optional<String>, #Optional.some!enumelt, %27 : $String
 //   br bb3(%28 : $Optional<String>)
 //
 // bb2:
@@ -759,33 +857,23 @@ namespace {
 //
 // bb3(%32 : $Optional<String>):
 class BridgedReturn {
-  SwitchEnumInst *SwitchEnum;
-  SILBasicBlock *SomeBB;
-  SILBasicBlock *NoneBB;
-  BranchInst *Br;
+  SwitchInfo switchInfo;
 public:
-  BridgedReturn() { clearState(); }
+  bool match(ApplyInst *BridgedCall) {
+    switchInfo = SwitchInfo();
+    auto *SwitchBB = BridgedCall->getParent();
+    return matchSwitch(switchInfo, SwitchBB->getTerminator(), BridgedCall);
+  }
 
-  bool match(ApplyInst *BridgedCall);
-  operator bool() { return SomeBB != nullptr; }
+  operator bool() { return switchInfo.SomeBB != nullptr; }
 
   CanType getReturnType() {
-    return Br->getArg(0)->getType().getSwiftRValueType();
+    return switchInfo.Br->getArg(0)->getType().getASTType();
   }
 
   /// Outline the return value bridging blocks.
   void outline(SILFunction *Fun, ApplyInst *NewOutlinedCall);
-
-private:
-  void clearState();
 };
-}
-
-void BridgedReturn::clearState() {
-  SomeBB = nullptr;
-  NoneBB = nullptr;
-  Br = nullptr;
-  SwitchEnum = nullptr;
 }
 
 void BridgedReturn::outline(SILFunction *Fun, ApplyInst *NewOutlinedCall) {
@@ -793,11 +881,11 @@ void BridgedReturn::outline(SILFunction *Fun, ApplyInst *NewOutlinedCall) {
 //   switch_enum %20 : $Optional<NSString>, case #O.some: bb1, case #O.none: bb2
 //
 // bb1(%23 : $NSString):
-//   %24 = function_ref @_T0SS10FoundationE36_unconditionallyBridgeFromObjectiveC
-//   %25 = enum $Optional<NSString>, #Optional.some!enumelt.1, %23 : $NSString
+//   %24 = function_ref @$SSS10FoundationE36_unconditionallyBridgeFromObjectiveC
+//   %25 = enum $Optional<NSString>, #Optional.some!enumelt, %23 : $NSString
 //   %26 = metatype $@thin String.Type
 //   %27 = apply %24(%25, %26)
-//   %28 = enum $Optional<String>, #Optional.some!enumelt.1, %27 : $String
+//   %28 = enum $Optional<String>, #Optional.some!enumelt, %27 : $String
 //   br bb3(%28 : $Optional<String>)
 //
 // bb2:
@@ -806,11 +894,11 @@ void BridgedReturn::outline(SILFunction *Fun, ApplyInst *NewOutlinedCall) {
 //
 // bb3(%32 : $Optional<String>):
 
-  auto *StartBB = SwitchEnum->getParent();
-  auto *OutlinedEntryBB = StartBB->split(SILBasicBlock::iterator(SwitchEnum));
-  auto *OldMergeBB = Br->getDestBB();
+  auto *StartBB = switchInfo.SwitchEnum->getParent();
+  auto *OutlinedEntryBB = StartBB->split(SILBasicBlock::iterator(switchInfo.SwitchEnum));
+  auto *OldMergeBB = switchInfo.Br->getDestBB();
   auto *NewTailBB = OldMergeBB->split(OldMergeBB->begin());
-	auto Loc = SwitchEnum->getLoc();
+	auto Loc = switchInfo.SwitchEnum->getLoc();
 
   {
     SILBuilder Builder(StartBB);
@@ -823,10 +911,10 @@ void BridgedReturn::outline(SILFunction *Fun, ApplyInst *NewOutlinedCall) {
   if (!Fun) {
     OutlinedEntryBB->eraseInstructions();
     OutlinedEntryBB->eraseFromParent();
-    NoneBB->eraseInstructions();
-    NoneBB->eraseFromParent();
-    SomeBB->eraseInstructions();
-    SomeBB->eraseFromParent();
+    switchInfo.NoneBB->eraseInstructions();
+    switchInfo.NoneBB->eraseFromParent();
+    switchInfo.SomeBB->eraseInstructions();
+    switchInfo.SomeBB->eraseFromParent();
     OldMergeBB->eraseInstructions();
     OldMergeBB->eraseFromParent();
     return;
@@ -841,114 +929,14 @@ void BridgedReturn::outline(SILFunction *Fun, ApplyInst *NewOutlinedCall) {
   OldMergeBB->moveAfter(EntryBB);
 	auto InsertPt = SILFunction::iterator(OldMergeBB);
   Fun->getBlocks().splice(InsertPt, FromBlockList, OutlinedEntryBB);
-  Fun->getBlocks().splice(InsertPt, FromBlockList, NoneBB);
-  Fun->getBlocks().splice(InsertPt, FromBlockList, SomeBB);
+  Fun->getBlocks().splice(InsertPt, FromBlockList, switchInfo.NoneBB);
+  Fun->getBlocks().splice(InsertPt, FromBlockList, switchInfo.SomeBB);
 
 	SILBuilder Builder (EntryBB);
   Builder.createBranch(Loc, OutlinedEntryBB);
 
   Builder.setInsertionPoint(OldMergeBB);
   Builder.createReturn(Loc, OldMergeBB->getArgument(0));
-}
-
-bool BridgedReturn::match(ApplyInst *BridgedCall) {
-  clearState();
-
-  auto *SwitchBB = BridgedCall->getParent();
-  // switch_enum %34 : $Optional<NSString>, case #Optional.some!enumelt.1: bb8, case #Optional.none!enumelt: bb9
-  auto *SwitchEnum = dyn_cast<SwitchEnumInst>(SwitchBB->getTerminator());
-  if (!SwitchEnum || SwitchEnum->getNumCases() != 2 ||
-      SwitchEnum->getOperand() != BridgedCall)
-    return false;
-
-  auto *SomeBB = SwitchEnum->getCase(0).second;
-  auto *NoneBB = SwitchEnum->getCase(1).second;
-  if (NoneBB->getSinglePredecessorBlock() != SwitchBB)
-    return false;
-  if (SomeBB->getSinglePredecessorBlock() != SwitchBB)
-    return false;
-  if (NoneBB->args_size() == 1)
-    std::swap(NoneBB, SomeBB);
-  if (SomeBB->args_size() != 1 || NoneBB->args_size() != 0)
-    return false;
-
-  // bb9:
-  // %43 = enum $Optional<String>, #Optional.none!enumelt
-  auto It = NoneBB->begin();
-  auto *Enum = dyn_cast<EnumInst>(It);
-  if (!Enum || Enum->hasOperand() || !Enum->hasOneUse())
-    return false;
-
-  // br bb10(%43 : $Optional<String>)
-  ADVANCE_ITERATOR_OR_RETURN_FALSE(It);
-  auto Br = dyn_cast<BranchInst>(It);
-  if (!Br || Br->getNumArgs() != 1 || Br->getArg(0) != Enum)
-    return false;
-  auto *MergeBB = Br->getDestBB();
-
-  // bb8(%36 : $NSString):
-  It = SomeBB->begin();
-  auto *SomeBBArg = SomeBB->getArgument(0);
-  if (!SomeBBArg->hasOneUse())
-    return false;
-
-  // %37 = function_ref @_T0SS10FoundationE36_unconditionallyBridgeFromObjectiveCSSSo8NSStringCSgFZ : $@convention(method) (@owned Optional<NSString>, @thin String.Type) -> @owned String
-  auto *FunRef = dyn_cast<FunctionRefInst>(It);
-  if (!FunRef || !FunRef->hasOneUse())
-    return false;
-
-  // %38 = enum $Optional<NSString>, #Optional.some!enumelt.1, %36 : $NSString
-  ADVANCE_ITERATOR_OR_RETURN_FALSE(It);
-  Enum = dyn_cast<EnumInst>(It);
-  if (!Enum || !Enum->hasOperand() || Enum->getOperand() != SomeBBArg ||
-      !Enum->hasOneUse())
-    return false;
-
-  // %39 = metatype $@thin String.Type
-  ADVANCE_ITERATOR_OR_RETURN_FALSE(It);
-  auto *Metatype = dyn_cast<MetatypeInst>(It);
-  if (!Metatype || !Metatype->hasOneUse())
-    return false;
-
-  // %40 = apply %37(%38, %39) : $@convention(method) (@owned Optional<NSString>, @thin String.Type) -> @owned String
-  ADVANCE_ITERATOR_OR_RETURN_FALSE(It);
-  auto *Apply = dyn_cast<ApplyInst>(It);
-  if (!Apply || !Apply->hasOneUse() || Apply->getCallee() != FunRef ||
-      Apply->getNumArguments() != 2 || Apply->getArgument(0) != Enum ||
-      Apply->getArgument(1) != Metatype ||
-      Apply->getSubstCalleeType()->getNumResults() != 1)
-    return false;
-  if (Apply->getSubstCalleeType()->getSingleResult().getConvention() !=
-      ResultConvention::Owned)
-    return false;
-
-  // Check that we call the _unconditionallyBridgeFromObjectiveC witness.
-  auto NativeType = Apply->getType().getSwiftRValueType();
-  auto *BridgeFun = FunRef->getReferencedFunction();
-  auto *SwiftModule = BridgeFun->getModule().getSwiftModule();
-  auto bridgeWitness = getBridgeFromObjectiveC(NativeType, SwiftModule);
-  if (BridgeFun->getName() != bridgeWitness.mangle())
-    return false;
-
-  // %41 = enum $Optional<String>, #Optional.some!enumelt.1, %40 : $String
-  ADVANCE_ITERATOR_OR_RETURN_FALSE(It);
-  Enum = dyn_cast<EnumInst>(It);
-  if (!Enum || !Enum->hasOneUse() || !Enum->hasOperand() ||
-      Enum->getOperand() != Apply)
-    return false;
-
-  // br bb10(%41 : $Optional<String>)
-  ADVANCE_ITERATOR_OR_RETURN_FALSE(It);
-  Br = dyn_cast<BranchInst>(It);
-  if (!Br || Br->getDestBB() != MergeBB || Br->getNumArgs() != 1 ||
-      Br->getArg(0) != Enum)
-    return false;
-
-  this->SomeBB = SomeBB;
-  this->NoneBB = NoneBB;
-  this->Br = Br;
-  this->SwitchEnum = SwitchEnum;
-  return true;
 }
 
 namespace {
@@ -958,13 +946,16 @@ class ObjCMethodCall : public OutlinePattern {
   SmallVector<BridgedArgument, 4> BridgedArguments;
   std::string OutlinedName;
   llvm::BitVector IsBridgedArgument;
-  BridgedReturn BridgedReturn;
+  llvm::BitVector IsGuaranteedArgument;
+  ::BridgedReturn BridgedReturn;
 public:
   bool matchInstSequence(SILBasicBlock::iterator I) override;
 
   std::pair<SILFunction *, SILBasicBlock::iterator>
   outline(SILModule &M) override;
 
+  ObjCMethodCall(SILOptFunctionBuilder &FuncBuilder)
+      : OutlinePattern(FuncBuilder) {}
   ~ObjCMethodCall();
 
 private:
@@ -983,17 +974,20 @@ void ObjCMethodCall::clearState() {
   BridgedCall = nullptr;
   BridgedArguments.clear();
   OutlinedName.clear();
+  IsBridgedArgument.clear();
+  IsGuaranteedArgument.clear();
 }
 
 std::pair<SILFunction *, SILBasicBlock::iterator>
 ObjCMethodCall::outline(SILModule &M) {
 
   auto FunctionType = getOutlinedFunctionType(M);
-  std::string name = getOutlinedFunctionName();
+  std::string nameTmp = getOutlinedFunctionName();
+  auto name = M.allocateCopy(nameTmp);
 
-  auto *Fun = M.getOrCreateFunction(ObjCMethod->getLoc(), name,
-                                    SILLinkage::Shared, FunctionType, IsNotBare,
-                                    IsNotTransparent, IsSerializable);
+  auto *Fun = FuncBuilder.getOrCreateFunction(
+      ObjCMethod->getLoc(), name, SILLinkage::Shared, FunctionType, IsNotBare,
+      IsNotTransparent, IsSerializable, IsNotDynamic);
   bool NeedsDefinition = Fun->empty();
 
   // Call the outlined function.
@@ -1017,9 +1011,9 @@ ObjCMethodCall::outline(SILModule &M) {
         // Otherwise, use the original type convention.
         Args.push_back(Arg);
       }
-      OrigSigIdx++;
+      ++OrigSigIdx;
     }
-    OutlinedCall = Builder.createApply(Loc, FunRef, Args, false);
+    OutlinedCall = Builder.createApply(Loc, FunRef, SubstitutionMap(), Args);
     if (!BridgedCall->use_empty() && !BridgedReturn)
       BridgedCall->replaceAllUsesWith(OutlinedCall);
   }
@@ -1037,8 +1031,8 @@ ObjCMethodCall::outline(SILModule &M) {
     return std::make_pair(Fun, I);
   }
 
-  if (ObjCMethod->getFunction()->hasUnqualifiedOwnership())
-    Fun->setUnqualifiedOwnership();
+  if (!ObjCMethod->getFunction()->hasOwnership())
+    Fun->setOwnershipEliminated();
 
   Fun->setInlineStrategy(NoInline);
 
@@ -1066,7 +1060,7 @@ ObjCMethodCall::outline(SILModule &M) {
       BridgedCall->setArgument(OrigSigIdx, FunArg);
       LastArg = FunArg;
     }
-    OrigSigIdx++;
+    ++OrigSigIdx;
   }
 
   // Set the method lookup's target.
@@ -1087,7 +1081,7 @@ ObjCMethodCall::outline(SILModule &M) {
 std::string ObjCMethodCall::getOutlinedFunctionName() {
   if (OutlinedName.empty()) {
     OutlinerMangler Mangler(ObjCMethod->getMember(), &IsBridgedArgument,
-                            BridgedReturn);
+                            &IsGuaranteedArgument, BridgedReturn);
     OutlinedName = Mangler.mangle();
   }
   return OutlinedName;
@@ -1097,8 +1091,12 @@ bool ObjCMethodCall::matchInstSequence(SILBasicBlock::iterator I) {
   clearState();
 
   ObjCMethod = dyn_cast<ObjCMethodInst>(I);
-  if (!ObjCMethod)
+  if (!ObjCMethod ||
+      ObjCMethod->getFunction()->getLoweredFunctionType()->isPolymorphic() ||
+      ObjCMethod->getType().castTo<SILFunctionType>()->isPolymorphic() ||
+      ObjCMethod->getType().castTo<SILFunctionType>()->hasOpenedExistential())
     return false;
+
   auto *Use = ObjCMethod->getSingleUse();
   if (!Use)
     return false;
@@ -1111,11 +1109,12 @@ bool ObjCMethodCall::matchInstSequence(SILBasicBlock::iterator I) {
   // Collect bridged parameters.
   unsigned Idx = 0;
   IsBridgedArgument.resize(BridgedCall->getNumArguments(), false);
+  IsGuaranteedArgument.resize(BridgedCall->getNumArguments(), false);
   for (auto &Param : BridgedCall->getArgumentOperands()) {
     unsigned CurIdx = Idx++;
 
     // Look for Optional<NSFoo> type.
-    auto Ty = Param.get()->getType().getAnyOptionalObjectType();
+    auto Ty = Param.get()->getType().getOptionalObjectType();
     if (!Ty)
       continue;
 
@@ -1131,6 +1130,8 @@ bool ObjCMethodCall::matchInstSequence(SILBasicBlock::iterator I) {
 
     BridgedArguments.push_back(BridgedArg);
     IsBridgedArgument.set(CurIdx);
+    if (BridgedArg.isGuaranteed())
+      IsGuaranteedArgument.set(CurIdx);
   }
 
   // Try to match a bridged return value.
@@ -1162,23 +1163,27 @@ CanSILFunctionType ObjCMethodCall::getOutlinedFunctionType(SILModule &M) {
     // Either use the bridged type passing it @owned.
     if (BridgedArgIdx < BridgedArguments.size() &&
         BridgedArguments[BridgedArgIdx].Idx == OrigSigIdx) {
+      auto convention = BridgedArguments[BridgedArgIdx].getConvention();
       Parameters.push_back(SILParameterInfo(BridgedArguments[BridgedArgIdx]
                                                 .bridgedValue()
                                                 ->getType()
-                                                .getSwiftRValueType(),
-                                            ParameterConvention::Direct_Owned));
+                                                .getASTType(),
+                                            convention));
       ++BridgedArgIdx;
     } else {
       // Otherwise, use the original type convention.
       Parameters.push_back(ParamInfo);
     }
-    OrigSigIdx++;
+    ++OrigSigIdx;
   }
 
   auto ExtInfo =
-      SILFunctionType::ExtInfo(SILFunctionType::Representation::Thin,
-                               /*pseudogeneric*/ false,
-                               /*noescape*/ false);
+      SILFunctionType::ExtInfoBuilder(SILFunctionType::Representation::Thin,
+                                      /*pseudogeneric*/ false,
+                                      /*noescape*/ false,
+                                      DifferentiabilityKind::NonDifferentiable,
+                                      /*clangFunctionType*/ nullptr)
+          .build();
 
   SmallVector<SILResultInfo, 4> Results;
   // If we don't have a bridged return we changed from @autoreleased to @owned
@@ -1186,7 +1191,7 @@ CanSILFunctionType ObjCMethodCall::getOutlinedFunctionType(SILModule &M) {
   if (!BridgedReturn) {
     if (FunTy->getNumResults()) {
       auto OrigResultInfo = FunTy->getSingleResult();
-      Results.push_back(SILResultInfo(OrigResultInfo.getType(),
+      Results.push_back(SILResultInfo(OrigResultInfo.getInterfaceType(),
                                       OrigResultInfo.getConvention() ==
                                               ResultConvention::Autoreleased
                                           ? ResultConvention::Owned
@@ -1198,9 +1203,11 @@ CanSILFunctionType ObjCMethodCall::getOutlinedFunctionType(SILModule &M) {
         SILResultInfo(BridgedReturn.getReturnType(), ResultConvention::Owned));
   }
   auto FunctionType = SILFunctionType::get(
-      nullptr, ExtInfo, SILCoroutineKind::None,
+      nullptr, ExtInfo, /*isAsync*/ false, SILCoroutineKind::None,
       ParameterConvention::Direct_Unowned, Parameters, {},
-      Results, None, M.getASTContext());
+      Results, None,
+      SubstitutionMap(), SubstitutionMap(),
+      M.getASTContext());
   return FunctionType;
 }
 
@@ -1213,7 +1220,7 @@ class OutlinePatterns {
   llvm::DenseMap<CanType, SILDeclRef> BridgeFromObjectiveCache;
 
 public:
-  /// Try matching an outlineable pattern from the current current instruction.
+  /// Try matching an outlineable pattern from the current instruction.
   OutlinePattern *tryToMatch(SILBasicBlock::iterator CurInst) {
     if (BridgedPropertyPattern.matchInstSequence(CurInst))
       return &BridgedPropertyPattern;
@@ -1224,7 +1231,9 @@ public:
     return nullptr;
   }
 
-  OutlinePatterns() {}
+  OutlinePatterns(SILOptFunctionBuilder &FuncBuilder)
+      : BridgedPropertyPattern(FuncBuilder),
+        ObjCMethodCallPattern(FuncBuilder) {}
   ~OutlinePatterns() {}
 
   OutlinePatterns(const OutlinePatterns&) = delete;
@@ -1235,11 +1244,12 @@ public:
 
 /// Perform outlining on the function and return any newly created outlined
 /// functions.
-bool tryOutline(SILFunction *Fun,
+bool tryOutline(SILOptFunctionBuilder &FuncBuilder, SILFunction *Fun,
                 SmallVectorImpl<SILFunction *> &FunctionsAdded) {
   SmallPtrSet<SILBasicBlock *, 32> Visited;
   SmallVector<SILBasicBlock *, 128> Worklist;
-  OutlinePatterns patterns;
+  OutlinePatterns patterns(FuncBuilder);
+  bool changed = false;
 
   // Traverse the function.
   Worklist.push_back(&*Fun->begin());
@@ -1260,6 +1270,7 @@ bool tryOutline(SILFunction *Fun,
            FunctionsAdded.push_back(F);
          CurInst = LastInst;
          assert(LastInst->getParent() == CurBlock);
+         changed = true;
        } else if (isa<TermInst>(CurInst)) {
          std::copy(CurBlock->succ_begin(), CurBlock->succ_end(),
                    std::back_inserter(Worklist));
@@ -1269,21 +1280,24 @@ bool tryOutline(SILFunction *Fun,
        }
     }
   }
-  return false;
+  return changed;
 }
 
 namespace {
+
 class Outliner : public SILFunctionTransform {
 public:
-
   Outliner() { }
 
   void run() override {
     auto *Fun = getFunction();
 
+    // We do not support [ossa] now.
+    if (Fun->hasOwnership())
+      return;
+
     // Only outline if we optimize for size.
-    if (Fun->getModule().getOptions().Optimization !=
-        SILOptions::SILOptMode::OptimizeForSize)
+    if (!Fun->optimizeForSize())
       return;
 
     // Dump function if requested.
@@ -1292,21 +1306,23 @@ public:
       Fun->dump();
     }
 
+    SILOptFunctionBuilder FuncBuilder(*this);
     SmallVector<SILFunction *, 16> FunctionsAdded;
-    bool Changed = tryOutline(Fun, FunctionsAdded);
+    bool Changed = tryOutline(FuncBuilder, Fun, FunctionsAdded);
 
     if (!FunctionsAdded.empty()) {
       // Notify the pass manager of any new functions we outlined.
       for (auto *AddedFunc : FunctionsAdded) {
-        notifyAddFunction(AddedFunc, nullptr);
+        addFunctionToPassManagerWorklist(AddedFunc, nullptr);
       }
     }
 
-		if (Changed) {
+    if (Changed) {
       invalidateAnalysis(SILAnalysis::InvalidationKind::Everything);
-		}
+    }
   }
 };
+
 } //end anonymous namespace.
 
 SILTransform *swift::createOutliner() {

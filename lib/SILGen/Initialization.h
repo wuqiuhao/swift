@@ -148,6 +148,9 @@ public:
                                    ManagedValue explodedElement,
                                    bool isInit) = 0;
 
+  /// Whether to emit a debug value during initialization.
+  void setEmitDebugValueOnInit(bool emit) { EmitDebugValueOnInit = emit; }
+
   /// Perform post-initialization bookkeeping for this initialization.
   virtual void finishInitialization(SILGenFunction &SGF) {}
 
@@ -157,6 +160,9 @@ public:
     llvm_unreachable("Initialization subclass does not support being left "
                      "uninitialized");
   }
+
+protected:
+  bool EmitDebugValueOnInit = true;
 
 private:
   Initialization(const Initialization &) = delete;
@@ -235,7 +241,6 @@ public:
   void finishUninitialized(SILGenFunction &SGF) override {}
 };
 
-/// Abstract base class for single-buffer initializations.
 class TemporaryInitialization : public SingleBufferInitialization {
   SILValue Addr;
   CleanupHandle Cleanup;

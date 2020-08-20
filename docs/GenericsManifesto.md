@@ -49,7 +49,7 @@ Currently, a generic type cannot be nested within another generic type, e.g.
 
 ```Swift
 struct X<T> {
-  struct Y<U> { }  // currently ill-formed, but should be possible
+  struct Y<U> { }
 }
 ```
 
@@ -87,6 +87,30 @@ typealias StringDictionary<Value> = Dictionary<String, Value>
 var d1 = StringDictionary<Int>()
 var d2: Dictionary<String, Int> = d1 // okay: d1 and d2 have the same type, Dictionary<String, Int>
 ```
+
+### Generic associatedtypes
+
+Associatedtypes could be allowed to carry generic parameters. 
+
+```Swift
+    protocol Wrapper {
+      associatedtype Wrapped<T>
+      
+      static func wrap<T>(_ t: T) -> Wrapped<T>
+    }
+```
+
+Generic associatedtypes would support all constraints supported by the language including where clauses.  As with non-generic associatedtypes conforming types would be required to provide a nested type or typealias matching the name of the associatedtype.  However, in this case the nested type or typealias would be generic.  
+
+```Swift
+    enum OptionalWrapper {
+      typealias Wrapped<T> = Optional<T>
+      
+      static func wrap<T>(_ t: T) -> Optional<T>
+    }
+```
+
+Note: generic associatedtypes address many use cases also addressed by higher-kinded types but with lower implementation complexity.
 
 ### Generic subscripts
 
@@ -249,6 +273,21 @@ typealias AnyObject = protocol<class>
 
 See the "Existentials" section, particularly "Generalized existentials", for more information.
 
+### Generalized supertype constraints
+
+Currently, supertype constraints may only be specified using a concrete class or protocol type.  This prevents us from abstracting over the supertype.
+
+```Swift
+protocol P {
+  associatedtype Base
+  associatedtype Derived: Base
+}
+```
+
+In the above example `Base` may be any type.  `Derived` may be the same as `Base` or may be _any_ subtype of `Base`.  All subtype relationships supported by Swift should be supported in this context including (but not limited to) classes and subclasses, existentials and conforming concrete types or refining existentials, `T?` and  `T`, `((Base) -> Void)` and `((Derived) -> Void)`, etc.
+
+Generalized supertype constraints would be accepted in all syntactic locations where generic constraints are accepted.
+
 ### Allowing subclasses to override requirements satisfied by defaults (*)
 
 When a superclass conforms to a protocol and has one of the protocol's requirements satisfied by a member of a protocol extension, that member currently cannot be overridden by a subclass. For example:
@@ -283,7 +322,7 @@ Unlike the minor extensions, major extensions to the generics model provide more
 
 ### Conditional conformances (*)
 
-*This feature has been accepted in [SE-0143](https://github.com/apple/swift-evolution/blob/master/proposals/0143-conditional-conformances.md) and is under development.*
+*This feature has been accepted in [SE-0143](https://github.com/apple/swift-evolution/blob/master/proposals/0143-conditional-conformances.md) and is implemented in Swift 4.2.*
 
 Conditional conformances express the notion that a generic type will conform to a particular protocol only under certain circumstances. For example, `Array` is `Equatable` only when its elements are `Equatable`:
 
@@ -346,7 +385,7 @@ public struct ZipIterator<... Iterators : IteratorProtocol> : Iterator {  // zer
   public mutating func next() -> Element? {
     if reachedEnd { return nil }
 
-    guard let values = (iterators.next()...) {   // call "next" on each of the iterators, put the results into a tuple named "values"
+    guard let values = (iterators.next()...) else {   // call "next" on each of the iterators, put the results into a tuple named "values"
       reachedEnd = true
       return nil
     }
@@ -655,9 +694,9 @@ foo(X())
 
 Under what circumstances should it print "P"? If `foo()` is defined within the same module as the conformance of `X` to `P`? If the call is defined within the same module as the conformance of `X` to `P`? Never? Either of the first two answers requires significant complications in the dynamic casting infrastructure to take into account the module in which a particular dynamic cast occurred (the first option) or where an existential was formed (the second option), while the third answer breaks the link between the static and dynamic type systems--none of which is an acceptable result.
 
-### Conditional conformances via protocol extensions
+### Retroactive protocol refinement
 
-We often get requests to make a protocol conform to another protocol. This is, effectively, the expansion of the notion of "Conditional conformances" to protocol extensions. For example:
+We often get requests to make protocols retroactively refine other protocols. For example:
 
 ```Swift
 protocol P {
@@ -668,8 +707,8 @@ protocol Q {
   func bar()
 }
 
-extension Q : P { // every type that conforms to Q also conforms to P
-  func foo() {    // implement "foo" requirement in terms of "bar"
+extension Q : P { // Make every type that conforms to Q also conforms to P
+  func foo() {    // Implement `P.foo` requirement in terms of `Q.bar`
     bar()
   }
 }
@@ -691,7 +730,7 @@ The generics system doesn't seem like a good candidate for a reduction in scope;
 
 ### Associated type inference
 
-*This feature has been rejected in [SE-0108](https://github.com/apple/swift-evolution/blob/master/proposals/0108-remove-assoctype-inference.md).*
+*[SE-0108](https://github.com/apple/swift-evolution/blob/master/proposals/0108-remove-assoctype-inference.md), a proposal to remove this feature, was rejected.*
 
 Associated type inference is the process by which we infer the type bindings for associated types from other requirements. For example:
 
@@ -757,9 +796,9 @@ if e1 == e2 { ... } // error: e1 and e2 don't necessarily have the same dynamic 
 One explicit way to allow such operations in a type-safe manner is to introduce an "open existential" operation of some sort, which extracts and gives a name to the dynamic type stored inside an existential. For example:
 
 ```Swift
-if let storedInE1 = e1 openas T {     // T is a the type of storedInE1, a copy of the value stored in e1
-  if let storedInE2 = e2 as? T {      // is e2 also a T?
-    if storedInE1 == storedInE2 { ... } // okay: storedInT1 and storedInE2 are both of type T, which we know is Equatable
+if let storedInE1 = e1 openas T { // T is the type of storedInE1, a copy of the value stored in e1
+  if let storedInE2 = e2 as? T {  // Does e2 have type T? If so, copy its value to storedInE2
+    if storedInE1 == storedInE2 { ... } // Okay: storedInT1 and storedInE2 are both of type T, which we know is Equatable
   }
 }
 ```

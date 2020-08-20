@@ -95,8 +95,8 @@ private:
   CanType ResultType;
 
   ForeignErrorConvention(Kind kind, unsigned parameterIndex, IsOwned_t isOwned,
-                         IsReplaced_t isReplaced, Type parameterType,
-                         Type resultType = Type())
+                         IsReplaced_t isReplaced, CanType parameterType,
+                         CanType resultType = CanType())
       : info(kind, parameterIndex, isOwned, isReplaced),
         ErrorParameterType(parameterType), ResultType(resultType) {}
 
@@ -181,6 +181,16 @@ public:
     assert(getKind() == ZeroResult ||
            getKind() == NonZeroResult);
     return ResultType;
+  }
+  
+  bool operator==(ForeignErrorConvention other) const {
+    return info.TheKind == other.info.TheKind
+      && info.ErrorIsOwned == other.info.ErrorIsOwned
+      && info.ErrorParameterIsReplaced == other.info.ErrorParameterIsReplaced
+      && info.ErrorParameterIndex == other.info.ErrorParameterIndex;
+  }
+  bool operator!=(ForeignErrorConvention other) const {
+    return !(*this == other);
   }
 };
 

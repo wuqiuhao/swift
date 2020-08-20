@@ -20,6 +20,7 @@
 #include "swift/IRGen/Linking.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Function.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include "Explosion.h"
@@ -31,12 +32,17 @@
 using namespace swift;
 using namespace irgen;
 
+static llvm::cl::opt<bool> EnableTrapDebugInfo(
+    "enable-trap-debug-info", llvm::cl::init(true), llvm::cl::Hidden,
+    llvm::cl::desc("Generate failure-message functions in the debug info"));
+
 IRGenFunction::IRGenFunction(IRGenModule &IGM, llvm::Function *Fn,
+                             OptimizationMode OptMode,
                              const SILDebugScope *DbgScope,
                              Optional<SILLocation> DbgLoc)
     : IGM(IGM), Builder(IGM.getLLVMContext(),
                         IGM.DebugInfo && !IGM.Context.LangOpts.DebuggerSupport),
-      CurFn(Fn), DbgScope(DbgScope), inOutlinedFunction(false) {
+      OptMode(OptMode), CurFn(Fn), DbgScope(DbgScope) {
 
   // Make sure the instructions in this function are attached its debug scope.
   if (IGM.DebugInfo) {
@@ -58,6 +64,13 @@ IRGenFunction::~IRGenFunction() {
 
   // Tear down any side-table data structures.
   if (LocalTypeData) destroyLocalTypeData();
+}
+
+OptimizationMode IRGenFunction::getEffectiveOptimizationMode() const {
+  if (OptMode != OptimizationMode::NotSet)
+    return OptMode;
+
+  return IGM.getOptions().OptMode;
 }
 
 ModuleDecl *IRGenFunction::getSwiftModule() const {
@@ -90,7 +103,8 @@ void IRGenFunction::emitMemCpy(llvm::Value *dest, llvm::Value *src,
 
 void IRGenFunction::emitMemCpy(llvm::Value *dest, llvm::Value *src,
                                llvm::Value *size, Alignment align) {
-  Builder.CreateMemCpy(dest, src, size, align.getValue(), false);
+  Builder.CreateMemCpy(dest, llvm::MaybeAlign(align.getValue()), src,
+                       llvm::MaybeAlign(align.getValue()), size);
 }
 
 void IRGenFunction::emitMemCpy(Address dest, Address src, Size size) {
@@ -164,7 +178,7 @@ llvm::Value *IRGenFunction::emitVerifyEndOfLifetimeCall(llvm::Value *object,
 void IRGenFunction::emitAllocBoxCall(llvm::Value *typeMetadata,
                                       llvm::Value *&box,
                                       llvm::Value *&valueAddress) {
-  auto attrs = llvm::AttributeList::get(IGM.LLVMContext,
+  auto attrs = llvm::AttributeList::get(IGM.getLLVMContext(),
                                         llvm::AttributeList::FunctionIndex,
                                         llvm::Attribute::NoUnwind);
 
@@ -181,7 +195,7 @@ void IRGenFunction::emitMakeBoxUniqueCall(llvm::Value *box,
                                           llvm::Value *alignMask,
                                           llvm::Value *&outBox,
                                           llvm::Value *&outValueAddress) {
-  auto attrs = llvm::AttributeList::get(IGM.LLVMContext,
+  auto attrs = llvm::AttributeList::get(IGM.getLLVMContext(),
                                         llvm::AttributeList::FunctionIndex,
                                         llvm::Attribute::NoUnwind);
 
@@ -196,7 +210,7 @@ void IRGenFunction::emitMakeBoxUniqueCall(llvm::Value *box,
 
 void IRGenFunction::emitDeallocBoxCall(llvm::Value *box,
                                         llvm::Value *typeMetadata) {
-  auto attrs = llvm::AttributeList::get(IGM.LLVMContext,
+  auto attrs = llvm::AttributeList::get(IGM.getLLVMContext(),
                                         llvm::AttributeList::FunctionIndex,
                                         llvm::Attribute::NoUnwind);
 
@@ -213,7 +227,7 @@ llvm::Value *IRGenFunction::emitProjectBoxCall(llvm::Value *box,
     llvm::Attribute::ReadNone,
   };
   auto attrs = llvm::AttributeList::get(
-      IGM.LLVMContext, llvm::AttributeList::FunctionIndex, attrKinds);
+      IGM.getLLVMContext(), llvm::AttributeList::FunctionIndex, attrKinds);
   llvm::CallInst *call =
     Builder.CreateCall(IGM.getProjectBoxFn(), box);
   call->setCallingConv(IGM.DefaultCC);
@@ -222,7 +236,7 @@ llvm::Value *IRGenFunction::emitProjectBoxCall(llvm::Value *box,
 }
 
 llvm::Value *IRGenFunction::emitAllocEmptyBoxCall() {
-  auto attrs = llvm::AttributeList::get(IGM.LLVMContext,
+  auto attrs = llvm::AttributeList::get(IGM.getLLVMContext(),
                                         llvm::AttributeList::FunctionIndex,
                                         llvm::Attribute::NoUnwind);
   llvm::CallInst *call =
@@ -386,11 +400,12 @@ llvm::Value *Offset::getAsValue(IRGenFunction &IGF) const {
   }
 }
 
-Offset Offset::offsetBy(IRGenFunction &IGF, Offset other) const {
-  if (isStatic() && other.isStatic()) {
-    return Offset(getStatic() + other.getStatic());
+Offset Offset::offsetBy(IRGenFunction &IGF, Size other) const {
+  if (isStatic()) {
+    return Offset(getStatic() + other);
   }
-  return Offset(IGF.Builder.CreateAdd(getDynamic(), other.getDynamic()));
+  auto otherVal = llvm::ConstantInt::get(IGF.IGM.SizeTy, other.getValue());
+  return Offset(IGF.Builder.CreateAdd(getDynamic(), otherVal));
 }
 
 Address IRGenFunction::emitAddressAtOffset(llvm::Value *base, Offset offset,
@@ -423,9 +438,37 @@ Address IRGenFunction::emitAddressAtOffset(llvm::Value *base, Offset offset,
   return Address(slotPtr, objectAlignment);
 }
 
-bool IRGenFunction::isInOutlinedFunction() { return inOutlinedFunction; }
+llvm::CallInst *IRBuilder::CreateNonMergeableTrap(IRGenModule &IGM,
+                                                  StringRef failureMsg) {
+  if (IGM.IRGen.Opts.shouldOptimize()) {
+    // Emit unique side-effecting inline asm calls in order to eliminate
+    // the possibility that an LLVM optimization or code generation pass
+    // will merge these blocks back together again. We emit an empty asm
+    // string with the side-effect flag set, and with a unique integer
+    // argument for each cond_fail we see in the function.
+    llvm::IntegerType *asmArgTy = IGM.Int32Ty;
+    llvm::Type *argTys = {asmArgTy};
+    llvm::FunctionType *asmFnTy =
+        llvm::FunctionType::get(IGM.VoidTy, argTys, false /* = isVarArg */);
+    llvm::InlineAsm *inlineAsm =
+        llvm::InlineAsm::get(asmFnTy, "", "n", true /* = SideEffects */);
+    CreateAsmCall(inlineAsm,
+                  llvm::ConstantInt::get(asmArgTy, NumTrapBarriers++));
+  }
 
-void IRGenFunction::setInOutlinedFunction() {
-  assert(!isInOutlinedFunction() && "Expected inOutlinedFunction to be false");
-  inOutlinedFunction = true;
+  // Emit the trap instruction.
+  llvm::Function *trapIntrinsic =
+      llvm::Intrinsic::getDeclaration(&IGM.Module, llvm::Intrinsic::trap);
+  if (EnableTrapDebugInfo && IGM.DebugInfo && !failureMsg.empty()) {
+    IGM.DebugInfo->addFailureMessageToCurrentLoc(*this, failureMsg);
+  }
+  auto Call = IRBuilderBase::CreateCall(trapIntrinsic, {});
+  setCallingConvUsingCallee(Call);
+  return Call;
+}
+
+void IRGenFunction::emitTrap(StringRef failureMessage, bool EmitUnreachable) {
+  Builder.CreateNonMergeableTrap(IGM, failureMessage);
+  if (EmitUnreachable)
+    Builder.CreateUnreachable();
 }

@@ -12,6 +12,7 @@
 
 import TestsUtils
 
+#if swift(>=4.2)
 public let RangeIteration = [
   BenchmarkInfo(
     name: "RangeIterationSigned",
@@ -29,8 +30,15 @@ public let RangeIteration = [
     tags: [.validation, .api]
   ),
 ]
-
-public var check: UInt64 = 0
+#else
+public let RangeIteration = [
+  BenchmarkInfo(
+    name: "RangeIterationSigned",
+    runFunction: run_RangeIterationSigned,
+    tags: [.validation, .api]
+  )
+]
+#endif
 
 @inline(never)
 func sum(_ x: UInt64, _ y: UInt64) -> UInt64 {
@@ -40,7 +48,7 @@ func sum(_ x: UInt64, _ y: UInt64) -> UInt64 {
 @inline(never)
 public func run_RangeIterationSigned(_ N: Int) {
   let range = 0..<100000
-  check = 0
+  var check: UInt64 = 0
   for _ in 1...N {
     for e in range {
       check = sum(check, UInt64(e))
@@ -50,10 +58,12 @@ public func run_RangeIterationSigned(_ N: Int) {
   CheckResults(check == 4999950000 * UInt64(N))
 }
 
+#if swift(>=4.2)
+
 @inline(never)
 public func run_RangeIterationSigned64(_ N: Int) {
-  let range: CountableRange<Int64> = 0..<100000
-  check = 0
+  let range: Range<Int64> = 0..<100000
+  var check: UInt64 = 0
   for _ in 1...N {
     for e in range {
       check = sum(check, UInt64(e))
@@ -65,8 +75,8 @@ public func run_RangeIterationSigned64(_ N: Int) {
 
 @inline(never)
 public func run_RangeIterationUnsigned(_ N: Int) {
-  let range: CountableRange<UInt> = 0..<100000
-  check = 0
+  let range: Range<UInt> = 0..<100000
+  var check: UInt64 = 0
   for _ in 1...N {
     for e in range {
       check = sum(check, UInt64(e))
@@ -75,3 +85,5 @@ public func run_RangeIterationUnsigned(_ N: Int) {
 
   CheckResults(check == 4999950000 * UInt64(N))
 }
+
+#endif

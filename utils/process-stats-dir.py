@@ -17,6 +17,7 @@
 
 import argparse
 import csv
+import io
 import itertools
 import json
 import os
@@ -25,13 +26,24 @@ import re
 import sys
 import time
 import urllib
-import urllib2
 from collections import namedtuple
 from operator import attrgetter
-from jobstats import load_stats_dir, merge_all_jobstats
 
+from jobstats import (list_stats_dir_profiles,
+                      load_stats_dir, merge_all_jobstats)
 
-MODULE_PAT = re.compile('^(\w+)\.')
+if sys.version_info[0] < 3:
+    import urllib2
+    Request = urllib2.Request
+    URLOpen = urllib2.urlopen
+else:
+    import urllib.request
+    import urllib.parse
+    import urllib.error
+    Request = urllib.request.Request
+    URLOpen = urllib.request.urlopen
+
+MODULE_PAT = re.compile(r'^(\w+)\.')
 
 
 def module_name_of_stat(name):
@@ -47,8 +59,12 @@ def stat_name_minus_module(name):
 def vars_of_args(args):
     vargs = vars(args)
     if args.select_stats_from_csv_baseline is not None:
-        b = read_stats_dict_from_csv(args.select_stats_from_csv_baseline)
-        if args.group_by_module:
+        with io.open(args.select_stats_from_csv_baseline, 'r', encoding='utf-8') as f:
+            b = read_stats_dict_from_csv(f)
+        # Sniff baseline stat-names to figure out if they're module-qualified
+        # even when the user isn't asking us to _output_ module-grouped data.
+        all_triples = all(len(k.split('.')) == 3 for k in b.keys())
+        if args.group_by_module or all_triples:
             vargs['select_stat'] = set(stat_name_minus_module(k)
                                        for k in b.keys())
         else:
@@ -84,6 +100,9 @@ def write_catapult_trace(args):
     vargs = vars_of_args(args)
     for path in args.remainder:
         allstats += load_stats_dir(path, **vargs)
+    allstats.sort(key=attrgetter('start_usec'))
+    for i in range(len(allstats)):
+        allstats[i].jobid = i
     json.dump([s.to_catapult_trace_obj() for s in allstats], args.output)
 
 
@@ -97,18 +116,18 @@ def write_lnt_values(args):
             json.dump(j, args.output, indent=4)
         else:
             url = args.lnt_submit
-            print "\nsubmitting to LNT server: " + url
+            print("\nsubmitting to LNT server: " + url)
             json_report = {'input_data': json.dumps(j), 'commit': '1'}
             data = urllib.urlencode(json_report)
-            response_str = urllib2.urlopen(urllib2.Request(url, data))
+            response_str = URLOpen(Request(url, data))
             response = json.loads(response_str.read())
-            print "### response:"
-            print response
+            print("### response:")
+            print(response)
             if 'success' in response:
-                print "server response:\tSuccess"
+                print("server response:\tSuccess")
             else:
-                print "server response:\tError"
-                print "error:\t", response['error']
+                print("server response:\tError")
+                print("error:\t", response['error'])
                 sys.exit(1)
 
 
@@ -179,8 +198,8 @@ def update_epoch_value(d, name, epoch, value):
             epoch = existing_epoch
         else:
             (_, delta_pct) = diff_and_pct(existing_value, value)
-            print ("note: changing value %d -> %d (%.2f%%) for %s" %
-                   (existing_value, value, delta_pct, name))
+            print("note: changing value %d -> %d (%.2f%%) for %s" %
+                  (existing_value, value, delta_pct, name))
             changed = 1
     d[name] = (epoch, value)
     return (epoch, value, changed)
@@ -225,22 +244,28 @@ def set_csv_baseline(args):
     existing = None
     vargs = vars_of_args(args)
     if os.path.exists(args.set_csv_baseline):
-        with open(args.set_csv_baseline, "r") as f:
+        with io.open(args.set_csv_baseline, "r", encoding='utf-8', newline='\n') as f:
             ss = vargs['select_stat']
             existing = read_stats_dict_from_csv(f, select_stat=ss)
-            print ("updating %d baseline entries in %s" %
-                   (len(existing), args.set_csv_baseline))
+            print("updating %d baseline entries in %s" %
+                  (len(existing), args.set_csv_baseline))
     else:
-        print "making new baseline " + args.set_csv_baseline
+        print("making new baseline " + args.set_csv_baseline)
     fieldnames = ["epoch", "name", "value"]
-    with open(args.set_csv_baseline, "wb") as f:
+
+    def _open(path):
+        if sys.version_info[0] < 3:
+            return open(path, 'wb')
+        return io.open(path, "w", encoding='utf-8', newline='\n')
+
+    with _open(args.set_csv_baseline) as f:
         out = csv.DictWriter(f, fieldnames, dialect='excel-tab',
                              quoting=csv.QUOTE_NONNUMERIC)
         m = merge_all_jobstats((s for d in args.remainder
                                 for s in load_stats_dir(d, **vargs)),
                                **vargs)
         if m is None:
-            print "no stats found"
+            print("no stats found")
             return 1
         changed = 0
         newepoch = int(time.time())
@@ -257,7 +282,7 @@ def set_csv_baseline(args):
                               name=name,
                               value=int(value)))
         if existing is not None:
-            print "changed %d entries in baseline" % changed
+            print("changed %d entries in baseline" % changed)
     return 0
 
 
@@ -308,9 +333,20 @@ def write_comparison(args, old_stats, new_stats):
 
     if args.markdown:
 
+        def format_time(v):
+            if abs(v) > 1000000:
+                return "{:.1f}s".format(v / 1000000.0)
+            elif abs(v) > 1000:
+                return "{:.1f}ms".format(v / 1000.0)
+            else:
+                return "{:.1f}us".format(v)
+
         def format_field(field, row):
-            if field == 'name' and args.group_by_module:
-                return stat_name_minus_module(row.name)
+            if field == 'name':
+                if args.group_by_module:
+                    return stat_name_minus_module(row.name)
+                else:
+                    return row.name
             elif field == 'delta_pct':
                 s = str(row.delta_pct) + "%"
                 if args.github_emoji:
@@ -320,7 +356,11 @@ def write_comparison(args, old_stats, new_stats):
                         s += " :white_check_mark:"
                 return s
             else:
-                return str(vars(row)[field])
+                v = int(vars(row)[field])
+                if row.name.startswith('time.'):
+                    return format_time(v)
+                else:
+                    return "{:,d}".format(v)
 
         def format_table(elts):
             out = args.output
@@ -357,10 +397,12 @@ def write_comparison(args, old_stats, new_stats):
                 format_table(elts)
             out.write('</details>\n')
 
-        format_details('Regressed', regressed, args.close_regressions)
+        closed_regressions = (args.close_regressions or len(regressed) == 0)
+        format_details('Regressed', regressed, closed_regressions)
         format_details('Improved', improved, True)
-        format_details('Unchanged (abs(delta) < %s%% or %susec)' %
-                       (args.delta_pct_thresh, args.delta_usec_thresh),
+        format_details('Unchanged (delta < %s%% or delta < %s)' %
+                       (args.delta_pct_thresh,
+                        format_time(args.delta_usec_thresh)),
                        unchanged, True)
 
     else:
@@ -377,8 +419,8 @@ def write_comparison(args, old_stats, new_stats):
 
 def compare_to_csv_baseline(args):
     vargs = vars_of_args(args)
-    old_stats = read_stats_dict_from_csv(args.compare_to_csv_baseline,
-                                         select_stat=vargs['select_stat'])
+    with io.open(args.compare_to_csv_baseline, 'r', encoding='utf-8') as f:
+        old_stats = read_stats_dict_from_csv(f, select_stat=vargs['select_stat'])
     m = merge_all_jobstats((s for d in args.remainder
                             for s in load_stats_dir(d, **vargs)),
                            **vargs)
@@ -414,7 +456,7 @@ def evaluate(args):
     vargs = vars_of_args(args)
     merged = merge_all_jobstats(load_stats_dir(d, **vargs), **vargs)
     env = {}
-    ident = re.compile('(\w+)$')
+    ident = re.compile(r'(\w+)$')
     for (k, v) in merged.stats.items():
         if k.startswith("time.") or '.time.' in k:
             continue
@@ -447,7 +489,7 @@ def evaluate_delta(args):
     new_stats = merge_all_jobstats(load_stats_dir(new, **vargs), **vargs)
 
     env = {}
-    ident = re.compile('(\w+)$')
+    ident = re.compile(r'(\w+)$')
     for r in compare_stats(args, old_stats.stats, new_stats.stats):
         if r.name.startswith("time.") or '.time.' in r.name:
             continue
@@ -467,6 +509,56 @@ def evaluate_delta(args):
     except Exception as e:
         print(e)
         return 1
+
+
+def render_profiles(args):
+    flamegraph_pl = args.flamegraph_script
+    if flamegraph_pl is None:
+        import distutils.spawn
+        flamegraph_pl = distutils.spawn.find_executable("flamegraph.pl")
+    if flamegraph_pl is None:
+        print("Need flamegraph.pl in $PATH, or pass --flamegraph-script")
+
+    vargs = vars_of_args(args)
+    for statsdir in args.remainder:
+        jobprofs = list_stats_dir_profiles(statsdir, **vargs)
+        index_path = os.path.join(statsdir, "profile-index.html")
+        all_profile_types = set([k for keys in [j.profiles.keys()
+                                                for j in jobprofs
+                                                if j.profiles is not None]
+                                 for k in keys])
+        with open(index_path, "wb") as index:
+            for ptype in all_profile_types:
+                index.write("<h2>Profile type: " + ptype + "</h2>\n")
+                index.write("<ul>\n")
+                for j in jobprofs:
+                    if j.is_frontend_job():
+                        index.write("    <li>" +
+                                    ("Module %s :: %s" %
+                                     (j.module, " ".join(j.jobargs))) + "\n")
+                        index.write("    <ul>\n")
+                        profiles = sorted(j.profiles.get(ptype, {}).items())
+                        for counter, path in profiles:
+                            title = ("Module: %s, File: %s, "
+                                     "Counter: %s, Profile: %s" %
+                                     (j.module, j.input, counter, ptype))
+                            subtitle = j.triple + ", -" + j.opt
+                            svg = os.path.abspath(path + ".svg")
+                            with open(path) as p, open(svg, "wb") as g:
+                                import subprocess
+                                print("Building flamegraph " + svg)
+                                subprocess.check_call([flamegraph_pl,
+                                                       "--title", title,
+                                                       "--subtitle", subtitle],
+                                                      stdin=p, stdout=g)
+                            link = ("<tt><a href=\"file://%s\">%s</a></tt>" %
+                                    (svg, counter))
+                            index.write("        <li>" + link + "\n")
+                        index.write("    </ul>\n")
+                        index.write("    </li>\n")
+        if args.browse_profiles:
+            import webbrowser
+            webbrowser.open_new_tab("file://" + os.path.abspath(index_path))
 
 
 def main():
@@ -510,7 +602,7 @@ def main():
                         action="append",
                         help="Select specific statistics")
     parser.add_argument("--select-stats-from-csv-baseline",
-                        type=argparse.FileType('rb', 0), default=None,
+                        type=str, default=None,
                         help="Select statistics present in a CSV baseline")
     parser.add_argument("--exclude-timers",
                         default=False,
@@ -528,6 +620,15 @@ def main():
                         default="sum",
                         type=str,
                         help="Merge identical metrics by (sum|min|max)")
+    parser.add_argument("--merge-timers",
+                        default=False,
+                        action="store_true",
+                        help="Merge timers across modules/targets/etc.")
+    parser.add_argument("--divide-by",
+                        default=1,
+                        metavar="D",
+                        type=int,
+                        help="Divide stats by D (to take an average)")
     parser.add_argument("--markdown",
                         default=False,
                         action="store_true",
@@ -551,8 +652,7 @@ def main():
                        help="summarize the 'incrementality' of a build")
     modes.add_argument("--set-csv-baseline", type=str, default=None,
                        help="Merge stats from a stats-dir into a CSV baseline")
-    modes.add_argument("--compare-to-csv-baseline",
-                       type=argparse.FileType('rb', 0), default=None,
+    modes.add_argument("--compare-to-csv-baseline", type=str, default=None,
                        metavar="BASELINE.csv",
                        help="Compare stats dir to named CSV baseline")
     modes.add_argument("--compare-stats-dirs",
@@ -564,6 +664,12 @@ def main():
                        help="evaluate an expression of stat-names")
     modes.add_argument("--evaluate-delta", type=str, default=None,
                        help="evaluate an expression of stat-deltas")
+    modes.add_argument("--render-profiles", action="store_true",
+                       help="render any profiles to SVG flamegraphs")
+    parser.add_argument("--flamegraph-script", type=str, default=None,
+                        help="path to flamegraph.pl")
+    parser.add_argument("--browse-profiles", action="store_true",
+                        help="open web browser tabs with rendered profiles")
     parser.add_argument('remainder', nargs=argparse.REMAINDER,
                         help="stats-dirs to process")
 
@@ -590,6 +696,8 @@ def main():
         return evaluate(args)
     elif args.evaluate_delta:
         return evaluate_delta(args)
+    elif args.render_profiles:
+        return render_profiles(args)
     return None
 
 

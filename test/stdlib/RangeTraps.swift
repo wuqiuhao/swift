@@ -13,6 +13,8 @@
 // RUN: %target-build-swift %s -o %t/a.out_Debug -Onone
 // RUN: %target-build-swift %s -o %t/a.out_Release -O
 //
+// RUN: %target-codesign %t/a.out_Debug
+// RUN: %target-codesign %t/a.out_Release
 // RUN: %target-run %t/a.out_Debug
 // RUN: %target-run %t/a.out_Release
 // REQUIRES: executable_test
@@ -72,7 +74,47 @@ RangeTraps.test("CountablePartialRangeFrom")
     _ = it.next()
 }
 
+RangeTraps.test("nanLowerBound")
+  .code {
+  expectCrashLater()
+  _ = Double.nan ... 0
+}
 
+RangeTraps.test("nanUpperBound")
+  .code {
+  expectCrashLater()
+  _ = 0 ... Double.nan
+}
+
+RangeTraps.test("nanLowerBoundPartial")
+  .code {
+  expectCrashLater()
+  _ = Double.nan ..< 0
+}
+
+RangeTraps.test("nanUpperBoundPartial")
+  .code {
+  expectCrashLater()
+  _ = 0 ..< Double.nan
+}
+
+RangeTraps.test("fromNaN")
+  .code {
+  expectCrashLater()
+  _ = Double.nan...
+}
+
+RangeTraps.test("toNaN")
+  .code {
+  expectCrashLater()
+  _ = ..<Double.nan
+}
+
+RangeTraps.test("throughNaN")
+  .code {
+  expectCrashLater()
+  _ = ...Double.nan
+}
 
 runAllTests()
 

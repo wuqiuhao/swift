@@ -23,12 +23,16 @@
 #include <utility>
 #include "swift/Runtime/HeapObject.h"
 #if SWIFT_OBJC_INTEROP
-#include "llvm/Support/Compiler.h"
 #include <objc/NSObject.h>
 #endif
 
 
 #if SWIFT_OBJC_INTEROP
+#if __OBJC__
+
+// Source code: "SwiftObject"
+// Real class name: mangled "Swift._SwiftObject"
+#define SwiftObject _TtCs12_SwiftObject
 
 #if __has_attribute(objc_root_class)
 __attribute__((__objc_root_class__))
@@ -68,23 +72,24 @@ SWIFT_RUNTIME_EXPORT @interface SwiftObject<NSObject> {
 - (instancetype)autorelease;
 - (NSUInteger)retainCount;
 
-- (NSString *)description;
-- (NSString *)debugDescription;
+- (id /* NSString */)description;
+- (id /* NSString */)debugDescription;
 @end
 
 namespace swift {
 
-struct String { void *x, *y, *z; };
-
-/// Helper from the standard library for stringizing an arbitrary object.
-extern "C" SWIFT_CC(swift)
-void swift_getSummary(String *out, OpaqueValue *value, const Metadata *T);
-
-// Convert a Swift String to an NSString.
-NSString *convertStringToNSString(String *swiftString);
+id getDescription(OpaqueValue *value, const Metadata *type);
 
 }
 
 #endif
+#endif
+
+namespace swift {
+
+/// Get the NSObject metadata.
+const Metadata *getNSObjectMetadata();
+
+}
 
 #endif

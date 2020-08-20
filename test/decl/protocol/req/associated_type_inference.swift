@@ -50,8 +50,8 @@ struct X0f : P0 { // okay: Assoc1 = Int because Float doesn't conform to PSimple
 }
 
 struct X0g : P0 { // expected-error{{type 'X0g' does not conform to protocol 'P0'}}
-  func f0(_: Float) { } // expected-note{{inferred type 'Float' (by matching requirement 'f0') is invalid: does not conform to 'PSimple'}}
-  func g0(_: Float) { } // expected-note{{inferred type 'Float' (by matching requirement 'g0') is invalid: does not conform to 'PSimple'}}
+  func f0(_: Float) { } // expected-note{{candidate would match and infer 'Assoc1' = 'Float' if 'Float' conformed to 'PSimple'}}
+  func g0(_: Float) { } // expected-note{{candidate would match and infer 'Assoc1' = 'Float' if 'Float' conformed to 'PSimple'}}
 }
 
 struct X0h<T : PSimple> : P0 {
@@ -93,8 +93,8 @@ protocol P2 {
 }
 
 extension P2 where Self.P2Assoc : PSimple {
-  func f0(_ x: P2Assoc) { } // expected-note{{inferred type 'Float' (by matching requirement 'f0') is invalid: does not conform to 'PSimple'}}
-  func g0(_ x: P2Assoc) { } // expected-note{{inferred type 'Float' (by matching requirement 'g0') is invalid: does not conform to 'PSimple'}}
+  func f0(_ x: P2Assoc) { } // expected-note{{candidate would match and infer 'Assoc1' = 'Float' if 'Float' conformed to 'PSimple'}}
+  func g0(_ x: P2Assoc) { } // expected-note{{candidate would match and infer 'Assoc1' = 'Float' if 'Float' conformed to 'PSimple'}}
 }
 
 struct X0k : P0, P2 {
@@ -123,7 +123,7 @@ struct XProp0a : PropertyP0 { // okay PropType = Int
 }
 
 struct XProp0b : PropertyP0 { // expected-error{{type 'XProp0b' does not conform to protocol 'PropertyP0'}}
-  var property: Float // expected-note{{inferred type 'Float' (by matching requirement 'property') is invalid: does not conform to 'PSimple'}}
+  var property: Float // expected-note{{candidate would match and infer 'Prop' = 'Float' if 'Float' conformed to 'PSimple'}}
 }
 
 // Inference from subscripts
@@ -144,12 +144,12 @@ struct XSubP0a : SubscriptP0 {
 
 struct XSubP0b : SubscriptP0 {
 // expected-error@-1{{type 'XSubP0b' does not conform to protocol 'SubscriptP0'}}
-  subscript (i: Int) -> Float { get { return Float(i) } } // expected-note{{inferred type 'Float' (by matching requirement 'subscript') is invalid: does not conform to 'PSimple'}}
+  subscript (i: Int) -> Float { get { return Float(i) } } // expected-note{{candidate would match and infer 'Element' = 'Float' if 'Float' conformed to 'PSimple'}}
 }
 
 struct XSubP0c : SubscriptP0 {
 // expected-error@-1 {{type 'XSubP0c' does not conform to protocol 'SubscriptP0'}}
-  subscript (i: Index) -> Element { get { } } // expected-error{{reference to invalid associated type 'Element' of type 'XSubP0c'}}
+  subscript (i: Index) -> Element { get { } }
 }
 
 struct XSubP0d : SubscriptP0 {
@@ -199,6 +199,7 @@ public class CorePromise<U> : Thenable { // expected-error{{type 'CorePromise<U>
     public func then(_ success: @escaping (_ t: U, _: CorePromise<U>) -> U) -> Self {
         return self.then() { (t: U) -> U in // expected-error{{contextual closure type '(U, CorePromise<U>) -> U' expects 2 arguments, but 1 was used in closure body}}
             return success(t: t, self)
+            // expected-error@-1 {{extraneous argument label 't:' in call}}
         }
     }
 }
@@ -400,3 +401,287 @@ struct P14a<Value>: P14 { }
 
 struct P14b<Value> { }
 extension P14b: P14 { }
+
+// Associated type defaults in overridden associated types.
+struct X15 { }
+struct OtherX15 { }
+
+protocol P15a {
+  associatedtype A = X15
+}
+
+protocol P15b : P15a {
+  associatedtype A
+}
+
+protocol P15c : P15b {
+  associatedtype A
+}
+
+protocol P15d {
+  associatedtype A = X15
+}
+
+protocol P15e : P15b, P15d {
+  associatedtype A
+}
+
+protocol P15f {
+  associatedtype A = OtherX15
+}
+
+protocol P15g: P15c, P15f {
+  associatedtype A // expected-note{{protocol requires nested type 'A'; do you want to add it?}}
+}
+
+
+struct X15a : P15a { }
+struct X15b : P15b { }
+struct X15c : P15c { }
+struct X15d : P15d { }
+
+// Ambiguity.
+// FIXME: Better diagnostic here?
+struct X15g : P15g { } // expected-error{{type 'X15g' does not conform to protocol 'P15g'}}
+
+// Associated type defaults in overidden associated types that require
+// substitution.
+struct X16<T> { }
+
+protocol P16 {
+  associatedtype A = X16<Self>
+}
+
+protocol P16a : P16 {
+  associatedtype A
+}
+
+protocol P16b : P16a {
+  associatedtype A
+}
+
+struct X16b : P16b { }
+
+// Refined protocols that tie associated types to a fixed type.
+protocol P17 {
+  associatedtype T
+}
+
+protocol Q17 : P17 where T == Int { }
+
+struct S17 : Q17 { }
+
+// Typealiases from protocol extensions should not inhibit associated type
+// inference.
+protocol P18 {
+  associatedtype A
+}
+
+protocol P19 : P18 {
+  associatedtype B
+}
+
+extension P18 where Self: P19 {
+  typealias A = B
+}
+
+struct X18<A> : P18 { }
+
+// rdar://problem/16316115
+protocol HasAssoc {
+  associatedtype Assoc
+}
+
+struct DefaultAssoc {}
+
+protocol RefinesAssocWithDefault: HasAssoc {
+  associatedtype Assoc = DefaultAssoc
+}
+
+struct Foo: RefinesAssocWithDefault {
+}
+
+protocol P20 {
+  associatedtype T // expected-note{{protocol requires nested type 'T'; do you want to add it?}}
+  typealias TT = T?
+}
+struct S19 : P20 {  // expected-error{{type 'S19' does not conform to protocol 'P20'}}
+  typealias TT = Int?
+}
+
+// rdar://problem/44777661
+struct S30<T> where T : P30 {}
+
+protocol P30 {
+  static func bar()
+}
+
+protocol P31 {
+  associatedtype T : P30
+}
+
+extension S30 : P31 where T : P31 {}
+
+extension S30 {
+  func foo() {
+    T.bar()
+  }
+}
+
+protocol P32 {
+  associatedtype A
+  associatedtype B
+  associatedtype C
+
+  func foo(arg: A) -> C
+  var bar: B { get }
+}
+protocol P33 {
+  associatedtype A
+
+  var baz: A { get } // expected-note {{protocol requires property 'baz' with type 'S31<T>.A' (aka 'Never'); do you want to add a stub?}}
+}
+protocol P34 {
+  associatedtype A
+
+  func boo() -> A // expected-note {{protocol requires function 'boo()' with type '() -> S31<T>.A' (aka '() -> Never'); do you want to add a stub?}}
+}
+struct S31<T> {}
+extension S31: P32 where T == Int {} // OK
+extension S31 where T == Int {
+  func foo(arg: Never) {}
+}
+extension S31 where T: Equatable {
+  var bar: Bool { true }
+}
+extension S31: P33 where T == Never {} // expected-error {{type 'S31<T>' does not conform to protocol 'P33'}}
+extension S31 where T == String {
+  var baz: Bool { true } // expected-note {{candidate has non-matching type 'Bool' [with A = S31<T>.A]}}
+}
+extension S31: P34 {} // expected-error {{type 'S31<T>' does not conform to protocol 'P34'}}
+extension S31 where T: P32 {
+  func boo() -> Void {} // expected-note {{candidate has non-matching type '<T> () -> Void' [with A = S31<T>.A]}}
+}
+
+// SR-12707
+
+class SR_12707_C<T> {}
+
+// Inference in the adoptee
+protocol SR_12707_P1 {
+  associatedtype A
+  associatedtype B: SR_12707_C<(A, Self)>
+
+  func foo(arg: B)
+}
+struct SR_12707_Conform_P1: SR_12707_P1 {
+  typealias A = Never
+
+  func foo(arg: SR_12707_C<(A, SR_12707_Conform_P1)>) {}
+}
+
+// Inference in protocol extension
+protocol SR_12707_P2: SR_12707_P1 {}
+extension SR_12707_P2 {
+  func foo(arg: SR_12707_C<(A, Self)>) {}
+}
+struct SR_12707_Conform_P2: SR_12707_P2 {
+  typealias A = Never
+}
+
+// SR-13172: Inference when witness is an enum case
+protocol SR_13172_P1 {
+  associatedtype Bar
+  static func bar(_ value: Bar) -> Self
+}
+
+enum SR_13172_E1: SR_13172_P1 {
+  case bar(String) // Okay
+}
+
+protocol SR_13172_P2 {
+  associatedtype Bar
+  static var bar: Bar { get }
+}
+
+enum SR_13172_E2: SR_13172_P2 {
+  case bar // Okay
+}
+
+/** References to type parameters in type witnesses. */
+
+// Circular reference through a fixed type witness.
+protocol P35a {
+  associatedtype A = Array<B> // expected-note {{protocol requires nested type 'A'}}
+  associatedtype B // expected-note {{protocol requires nested type 'B'}}
+}
+protocol P35b: P35a where B == A {}
+// expected-error@+2 {{type 'S35' does not conform to protocol 'P35a'}}
+// expected-error@+1 {{type 'S35' does not conform to protocol 'P35b'}}
+struct S35: P35b {}
+
+// Circular reference through a value witness.
+protocol P36a {
+  associatedtype A // expected-note {{protocol requires nested type 'A'}}
+
+  func foo(arg: A)
+}
+protocol P36b: P36a {
+  associatedtype B = (Self) -> A // expected-note {{protocol requires nested type 'B'}}
+}
+// expected-error@+2 {{type 'S36' does not conform to protocol 'P36a'}}
+// expected-error@+1 {{type 'S36' does not conform to protocol 'P36b'}}
+struct S36: P36b {
+  func foo(arg: Array<B>) {}
+}
+
+// Test that we can resolve abstract type witnesses that reference
+// other abstract type witnesses.
+protocol P37 {
+  associatedtype A = Array<B>
+  associatedtype B: Equatable = Never
+}
+struct S37: P37 {}
+
+protocol P38a {
+  associatedtype A = Never
+  associatedtype B: Equatable
+}
+protocol P38b: P38a where B == Array<A> {}
+struct S38: P38b {}
+
+protocol P39 where A: Sequence {
+  associatedtype A = Array<B>
+  associatedtype B
+}
+struct S39<B>: P39 {}
+
+// Test that we can handle an analogous complex case involving all kinds of
+// type witness resolution.
+protocol P40a {
+  associatedtype A
+  associatedtype B: P40a
+
+  func foo(arg: A)
+}
+protocol P40b: P40a {
+  associatedtype C = (A, B.A, D.D, E) -> Self
+  associatedtype D: P40b
+  associatedtype E: Equatable
+}
+protocol P40c: P40b where D == S40<Never> {}
+struct S40<E: Equatable>: P40c {
+  func foo(arg: Never) {}
+
+  typealias B = Self
+}
+
+// Fails to find the fixed type witness B == FIXME_S1<A>.
+protocol FIXME_P1a {
+  associatedtype A: Equatable = Never // expected-note {{protocol requires nested type 'A'}}
+  associatedtype B: FIXME_P1a // expected-note {{protocol requires nested type 'B'}}
+}
+protocol FIXME_P1b: FIXME_P1a where B == FIXME_S1<A> {}
+// expected-error@+2 {{type 'FIXME_S1<T>' does not conform to protocol 'FIXME_P1a'}}
+// expected-error@+1 {{type 'FIXME_S1<T>' does not conform to protocol 'FIXME_P1b'}}
+struct FIXME_S1<T: Equatable>: FIXME_P1b {}

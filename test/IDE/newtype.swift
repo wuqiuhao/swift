@@ -83,7 +83,7 @@
 // PRINT-NEXT:  let Notification: String
 // PRINT-NEXT:  let swiftNamedNotification: String
 //
-// PRINT-LABEL: struct CFNewType : _SwiftNewtypeWrapper, RawRepresentable {
+// PRINT-LABEL: struct CFNewType : Hashable, Equatable, _SwiftNewtypeWrapper, RawRepresentable {
 // PRINT-NEXT:    init(_ rawValue: CFString)
 // PRINT-NEXT:    init(rawValue: CFString)
 // PRINT-NEXT:    let rawValue: CFString
@@ -97,7 +97,7 @@
 // PRINT-NEXT:  func FooAudited() -> CFNewType
 // PRINT-NEXT:  func FooUnaudited() -> Unmanaged<CFString>
 //
-// PRINT-LABEL: struct MyABINewType : _SwiftNewtypeWrapper, RawRepresentable {
+// PRINT-LABEL: struct MyABINewType : Hashable, Equatable, _SwiftNewtypeWrapper, RawRepresentable {
 // PRINT-NEXT:    init(_ rawValue: CFString)
 // PRINT-NEXT:    init(rawValue: CFString)
 // PRINT-NEXT:    let rawValue: CFString
@@ -215,7 +215,7 @@ func tests() {
 	let _ : CFNewType = CFNewType.MyCFNewTypeValue
 	let _ : CFNewType = CFNewType.MyCFNewTypeValueUnauditedButConst
 	let _ : CFNewType = CFNewType.MyCFNewTypeValueUnaudited
-	  // expected-error@-1{{cannot convert value of type 'Unmanaged<CFString>!' to specified type 'CFNewType'}}
+	  // expected-error@-1{{cannot convert value of type 'Unmanaged<CFString>?' to specified type 'CFNewType'}}
 }
 
 func acceptSwiftNewtypeWrapper<T : _SwiftNewtypeWrapper>(_ t: T) { }
@@ -233,4 +233,24 @@ func testConformances(ed: ErrorDomain) {
 func testFixit() {
 	let _ = NSMyContextName
 	  // expected-error@-1{{'NSMyContextName' has been renamed to 'NSSomeContext.Name.myContextName'}} {{10-25=NSSomeContext.Name.myContextName}}
+}
+
+func testNonEphemeralInitParams(x: OpaquePointer) {
+  var x = x
+
+  _ = TRefRef(&x) // expected-warning {{inout expression creates a temporary pointer, but argument #1 should be a pointer that outlives the call to 'init(_:)'}}
+  // expected-note@-1 {{implicit argument conversion from 'OpaquePointer' to 'UnsafeMutablePointer<OpaquePointer>' produces a pointer valid only for the duration of the call}}
+  // expected-note@-2 {{use 'withUnsafeMutablePointer' in order to explicitly convert argument to pointer valid for a defined scope}}
+
+  _ = TRefRef(rawValue: &x) // expected-warning {{inout expression creates a temporary pointer, but argument 'rawValue' should be a pointer that outlives the call to 'init(rawValue:)'}}
+  // expected-note@-1 {{implicit argument conversion from 'OpaquePointer' to 'UnsafeMutablePointer<OpaquePointer>' produces a pointer valid only for the duration of the call}}
+  // expected-note@-2 {{use 'withUnsafeMutablePointer' in order to explicitly convert argument to pointer valid for a defined scope}}
+
+  _ = ConstTRefRef(&x) // expected-warning {{inout expression creates a temporary pointer, but argument #1 should be a pointer that outlives the call to 'init(_:)'}}
+  // expected-note@-1 {{implicit argument conversion from 'OpaquePointer' to 'UnsafePointer<OpaquePointer>' produces a pointer valid only for the duration of the call}}
+  // expected-note@-2 {{use 'withUnsafePointer' in order to explicitly convert argument to pointer valid for a defined scope}}
+
+  _ = ConstTRefRef(rawValue: &x) // expected-warning {{inout expression creates a temporary pointer, but argument 'rawValue' should be a pointer that outlives the call to 'init(rawValue:)'}}
+  // expected-note@-1 {{implicit argument conversion from 'OpaquePointer' to 'UnsafePointer<OpaquePointer>' produces a pointer valid only for the duration of the call}}
+  // expected-note@-2 {{use 'withUnsafePointer' in order to explicitly convert argument to pointer valid for a defined scope}}
 }

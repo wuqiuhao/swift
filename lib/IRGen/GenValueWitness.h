@@ -31,22 +31,21 @@ namespace swift {
 namespace irgen {
   class ConstantStructBuilder;
   class IRGenModule;
+  class ConstantReference;
 
   /// True if a type has a generic-parameter-dependent value witness table.
   /// Currently, this is true if the size and/or alignment of the type is
   /// dependent on its generic parameters.
   bool hasDependentValueWitnessTable(IRGenModule &IGM, CanType ty);
 
-  /// Emit a value-witness table for the given type, which is assumed
-  /// to be non-dependent.
-  llvm::Constant *emitValueWitnessTable(IRGenModule &IGM, CanType type);
-
-  /// Emit the elements of a dependent value witness table template into a
-  /// vector.
-  void emitDependentValueWitnessTablePattern(IRGenModule &IGM,
-                                             ConstantStructBuilder &B,
-                                             CanType abstractType);
-
+  /// Emit a value-witness table for the given type.
+  ///
+  /// \param isPattern - true if the table just serves as an instantiation
+  ///   pattern and does not need to be modifiable in-place (if the type
+  ///   does not have static layout for some reason)
+  ConstantReference emitValueWitnessTable(IRGenModule &IGM, CanType type,
+                                          bool isPattern,
+                                          bool relativeReference);
 }
 }
 

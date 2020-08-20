@@ -22,6 +22,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/AST/ASTContext.h"
+#include "swift/AST/IRGenOptions.h"
 #include "swift/AST/Types.h"
 #include "swift/IRGen/Linking.h"
 #include "swift/SIL/TypeLowering.h"
@@ -34,7 +35,9 @@
 #include "Explosion.h"
 #include "FixedTypeInfo.h"
 #include "GenEnum.h"
+#include "GenMeta.h"
 #include "GenOpaque.h"
+#include "GenPointerAuth.h"
 #include "IRGenDebugInfo.h"
 #include "IRGenFunction.h"
 #include "IRGenModule.h"
@@ -55,16 +58,13 @@ const char *irgen::getValueWitnessName(ValueWitness witness) {
   CASE(InitializeBufferWithCopyOfBuffer)
   CASE(InitializeWithCopy)
   CASE(InitializeWithTake)
-  CASE(InitializeBufferWithTakeOfBuffer)
-  CASE(StoreExtraInhabitant)
-  CASE(GetExtraInhabitantIndex)
   CASE(GetEnumTag)
   CASE(DestructiveProjectEnumData)
   CASE(DestructiveInjectEnumTag)
   CASE(Size)
   CASE(Flags)
+  CASE(ExtraInhabitantCount)
   CASE(Stride)
-  CASE(ExtraInhabitantFlags)
   CASE(GetEnumTagSinglePayload)
   CASE(StoreEnumTagSinglePayload)
 #undef CASE
@@ -117,7 +117,8 @@ namespace {
   /// An implementation of DynamicPackingPHIMapping for Addresses.
   template <> class DynamicPackingPHIMapping<Address>
       : private DynamicPackingPHIMapping<llvm::Value*> {
-    typedef DynamicPackingPHIMapping<llvm::Value*> super;
+    using super = DynamicPackingPHIMapping<llvm::Value *>;
+
   public:
     void collect(IRGenFunction &IGF, Address value) {
       super::collect(IGF, value.getAddress());
@@ -312,7 +313,7 @@ static Address emitDefaultInitializeBufferWithCopyOfBuffer(
         emitDefaultAllocateBuffer(IGF, destBuffer, T, type, packing);
     Address srcObject =
         emitDefaultProjectBuffer(IGF, srcBuffer, T, type, packing);
-    type.initializeWithCopy(IGF, destObject, srcObject, T);
+    type.initializeWithCopy(IGF, destObject, srcObject, T, true);
     return destObject;
   } else {
     assert(packing == FixedPacking::Allocate);
@@ -327,47 +328,6 @@ static Address emitDefaultInitializeBufferWithCopyOfBuffer(
         srcReference, Address(destReferenceAddr, destBuffer.getAlignment()));
     return emitDefaultProjectBuffer(IGF, destBuffer, T, type, packing);
   }
-}
-
-/// Emit an 'initializeBufferWithTakeOfBuffer' operation.
-/// Returns the address of the destination object.
-static Address
-emitDefaultInitializeBufferWithTakeOfBuffer(IRGenFunction &IGF,
-                                            Address destBuffer,
-                                            Address srcBuffer,
-                                            SILType T,
-                                            const TypeInfo &type,
-                                            FixedPacking packing) {
-  switch (packing) {
-
-  case FixedPacking::Dynamic:
-    // Special-case dynamic packing in order to thread the jumps.
-    return emitForDynamicPacking(IGF,
-                                 &emitDefaultInitializeBufferWithTakeOfBuffer,
-                                 T, type, destBuffer, srcBuffer);
-
-  case FixedPacking::OffsetZero: {
-    // Both of these allocations/projections should be no-ops.
-    Address destObject =
-      emitDefaultAllocateBuffer(IGF, destBuffer, T, type, packing);
-    Address srcObject =
-      emitDefaultProjectBuffer(IGF, srcBuffer, T, type, packing);
-    type.initializeWithTake(IGF, destObject, srcObject, T);
-    return destObject;
-  }
-
-  case FixedPacking::Allocate: {
-    // Just copy the out-of-line storage pointers.
-    srcBuffer = IGF.Builder.CreateBitCast(
-        srcBuffer, IGF.IGM.RefCountedPtrTy->getPointerTo());
-    llvm::Value *addr = IGF.Builder.CreateLoad(srcBuffer);
-    destBuffer = IGF.Builder.CreateBitCast(
-        destBuffer, IGF.IGM.RefCountedPtrTy->getPointerTo());
-    IGF.Builder.CreateStore(addr, destBuffer);
-    return emitDefaultProjectBuffer(IGF, destBuffer, T, type, packing);
-  }
-  }
-  llvm_unreachable("bad fixed packing");
 }
 
 // Metaprogram some of the common boilerplate here:
@@ -390,8 +350,6 @@ static Address emit##TITLE(IRGenFunction &IGF, Address dest, Address src, \
 }
 DEFINE_BINARY_BUFFER_OP(initializeBufferWithCopyOfBuffer,
                         InitializeBufferWithCopyOfBuffer)
-DEFINE_BINARY_BUFFER_OP(initializeBufferWithTakeOfBuffer,
-                        InitializeBufferWithTakeOfBuffer)
 #undef DEFINE_BINARY_BUFFER_OP
 
 
@@ -455,18 +413,50 @@ static CanType getFormalTypeInContext(CanType abstractType) {
   return abstractType;
 }
 
+void irgen::getArgAsLocalSelfTypeMetadata(IRGenFunction &IGF, llvm::Value *arg,
+                                          CanType abstractType) {
+  assert(arg->getType() == IGF.IGM.TypeMetadataPtrTy &&
+         "Self argument is not a type?!");
+
+  auto formalType = getFormalTypeInContext(abstractType);
+  IGF.bindLocalTypeDataFromTypeMetadata(formalType, IsExact, arg,
+                                        MetadataState::Complete);
+}
+
 /// Get the next argument and use it as the 'self' type metadata.
 static void getArgAsLocalSelfTypeMetadata(IRGenFunction &IGF,
                                           llvm::Function::arg_iterator &it,
                                           CanType abstractType) {
   llvm::Value *arg = &*it++;
-  assert(arg->getType() == IGF.IGM.TypeMetadataPtrTy &&
-         "Self argument is not a type?!");
-
-  auto formalType = getFormalTypeInContext(abstractType);
-  IGF.bindLocalTypeDataFromTypeMetadata(formalType, IsExact, arg);
+  getArgAsLocalSelfTypeMetadata(IGF, arg, abstractType);
 }
 
+static const TypeLayoutEntry *
+conditionallyGetTypeLayoutEntry(IRGenModule &IGM, SILType concreteType) {
+  if (!IGM.getOptions().UseTypeLayoutValueHandling)
+    return nullptr;
+
+  auto &typeLayoutEntry = IGM.getTypeLayoutEntry(concreteType);
+
+  // Don't use type layout based generation for layouts that contain a resilient
+  // field but no archetype. We don't expect a speadup by using type layout
+  // based ir generation.
+  if ((typeLayoutEntry.containsResilientField() &&
+       !typeLayoutEntry.containsArchetypeField()) ||
+      typeLayoutEntry.containsDependentResilientField())
+    return nullptr;
+
+  return &typeLayoutEntry;
+}
+
+static const EnumTypeLayoutEntry *
+conditionallyGetEnumTypeLayoutEntry(IRGenModule &IGM, SILType concreteType) {
+  auto *entry = conditionallyGetTypeLayoutEntry(IGM, concreteType);
+  if (!entry)
+    return nullptr;
+
+  return entry->getAsEnum();
+}
 
 /// Build a specific value-witness function.
 static void buildValueWitnessFunction(IRGenModule &IGM,
@@ -488,7 +478,13 @@ static void buildValueWitnessFunction(IRGenModule &IGM,
     Address dest = getArgAs(IGF, argv, type, "dest");
     Address src = getArgAs(IGF, argv, type, "src");
     getArgAsLocalSelfTypeMetadata(IGF, argv, abstractType);
-    type.assignWithCopy(IGF, dest, src, concreteType);
+
+    if (auto *typeLayoutEntry =
+            conditionallyGetTypeLayoutEntry(IGM, concreteType)) {
+      typeLayoutEntry->assignWithCopy(IGF, dest, src);
+    } else {
+      type.assignWithCopy(IGF, dest, src, concreteType, true);
+    }
     dest = IGF.Builder.CreateBitCast(dest, IGF.IGM.OpaquePtrTy);
     IGF.Builder.CreateRet(dest.getAddress());
     return;
@@ -498,7 +494,12 @@ static void buildValueWitnessFunction(IRGenModule &IGM,
     Address dest = getArgAs(IGF, argv, type, "dest");
     Address src = getArgAs(IGF, argv, type, "src");
     getArgAsLocalSelfTypeMetadata(IGF, argv, abstractType);
-    type.assignWithTake(IGF, dest, src, concreteType);
+    if (auto *typeLayoutEntry =
+            conditionallyGetTypeLayoutEntry(IGM, concreteType)) {
+      typeLayoutEntry->assignWithTake(IGF, dest, src);
+    } else {
+      type.assignWithTake(IGF, dest, src, concreteType, true);
+    }
     dest = IGF.Builder.CreateBitCast(dest, IGF.IGM.OpaquePtrTy);
     IGF.Builder.CreateRet(dest.getAddress());
     return;
@@ -507,7 +508,12 @@ static void buildValueWitnessFunction(IRGenModule &IGM,
   case ValueWitness::Destroy: {
     Address object = getArgAs(IGF, argv, type, "object");
     getArgAsLocalSelfTypeMetadata(IGF, argv, abstractType);
-    type.destroy(IGF, object, concreteType);
+    if (auto *typeLayoutEntry =
+            conditionallyGetTypeLayoutEntry(IGM, concreteType)) {
+      typeLayoutEntry->destroy(IGF, object);
+    } else {
+      type.destroy(IGF, object, concreteType, true);
+    }
     IGF.Builder.CreateRetVoid();
     return;
   }
@@ -517,24 +523,17 @@ static void buildValueWitnessFunction(IRGenModule &IGM,
     Address src = getArgAsBuffer(IGF, argv, "src");
     getArgAsLocalSelfTypeMetadata(IGF, argv, abstractType);
 
-    Address result =
-      emitInitializeBufferWithCopyOfBuffer(IGF, dest, src, concreteType,
-                                           type, packing);
-    result = IGF.Builder.CreateBitCast(result, IGF.IGM.OpaquePtrTy);
-    IGF.Builder.CreateRet(result.getAddress());
-    return;
-  }
-
-  case ValueWitness::InitializeBufferWithTakeOfBuffer: {
-    Address dest = getArgAsBuffer(IGF, argv, "dest");
-    Address src = getArgAsBuffer(IGF, argv, "src");
-    getArgAsLocalSelfTypeMetadata(IGF, argv, abstractType);
-
-    Address result =
-      emitInitializeBufferWithTakeOfBuffer(IGF, dest, src, concreteType,
-                                           type, packing);
-    result = IGF.Builder.CreateBitCast(result, IGF.IGM.OpaquePtrTy);
-    IGF.Builder.CreateRet(result.getAddress());
+    llvm::Value *objectPtr = nullptr;
+    if (auto *typeLayoutEntry =
+            conditionallyGetTypeLayoutEntry(IGM, concreteType)) {
+      objectPtr = typeLayoutEntry->initBufferWithCopyOfBuffer(IGF, dest, src);
+    } else {
+      Address result = emitInitializeBufferWithCopyOfBuffer(
+          IGF, dest, src, concreteType, type, packing);
+      result = IGF.Builder.CreateBitCast(result, IGF.IGM.OpaquePtrTy);
+      objectPtr = result.getAddress();
+    }
+    IGF.Builder.CreateRet(objectPtr);
     return;
   }
 
@@ -542,8 +541,12 @@ static void buildValueWitnessFunction(IRGenModule &IGM,
     Address dest = getArgAs(IGF, argv, type, "dest");
     Address src = getArgAs(IGF, argv, type, "src");
     getArgAsLocalSelfTypeMetadata(IGF, argv, abstractType);
-
-    type.initializeWithCopy(IGF, dest, src, concreteType);
+    if (auto *typeLayoutEntry =
+            conditionallyGetTypeLayoutEntry(IGM, concreteType)) {
+      typeLayoutEntry->initWithCopy(IGF, dest, src);
+    } else {
+      type.initializeWithCopy(IGF, dest, src, concreteType, true);
+    }
     dest = IGF.Builder.CreateBitCast(dest, IGF.IGM.OpaquePtrTy);
     IGF.Builder.CreateRet(dest.getAddress());
     return;
@@ -554,28 +557,14 @@ static void buildValueWitnessFunction(IRGenModule &IGM,
     Address src = getArgAs(IGF, argv, type, "src");
     getArgAsLocalSelfTypeMetadata(IGF, argv, abstractType);
 
-    type.initializeWithTake(IGF, dest, src, concreteType);
+    if (auto *typeLayoutEntry =
+            conditionallyGetTypeLayoutEntry(IGM, concreteType)) {
+      typeLayoutEntry->initWithTake(IGF, dest, src);
+    } else {
+      type.initializeWithTake(IGF, dest, src, concreteType, true);
+    }
     dest = IGF.Builder.CreateBitCast(dest, IGF.IGM.OpaquePtrTy);
     IGF.Builder.CreateRet(dest.getAddress());
-    return;
-  }
-
-  case ValueWitness::StoreExtraInhabitant: {
-    Address dest = getArgAs(IGF, argv, type, "dest");
-    llvm::Value *index = getArg(argv, "index");
-    getArgAsLocalSelfTypeMetadata(IGF, argv, abstractType);
-
-    type.storeExtraInhabitant(IGF, index, dest, concreteType);
-    IGF.Builder.CreateRetVoid();
-    return;
-  }
-
-  case ValueWitness::GetExtraInhabitantIndex: {
-    Address src = getArgAs(IGF, argv, type, "src");
-    getArgAsLocalSelfTypeMetadata(IGF, argv, abstractType);
-
-    llvm::Value *idx = type.getExtraInhabitantIndex(IGF, src, concreteType);
-    IGF.Builder.CreateRet(idx);
     return;
   }
 
@@ -589,7 +578,13 @@ static void buildValueWitnessFunction(IRGenModule &IGM,
     value = IGF.Builder.CreateBitCast(value, enumTy);
     auto enumAddr = type.getAddressForPointer(value);
 
-    llvm::Value *result = strategy.emitGetEnumTag(IGF, concreteType, enumAddr);
+    llvm::Value *result;
+    if (auto *enumTypeLayoutEntry =
+            conditionallyGetEnumTypeLayoutEntry(IGM, concreteType)) {
+      result = enumTypeLayoutEntry->getEnumTag(IGF, enumAddr);
+    } else {
+      result = strategy.emitGetEnumTag(IGF, concreteType, enumAddr);
+    }
     IGF.Builder.CreateRet(result);
     return;
   }
@@ -600,10 +595,15 @@ static void buildValueWitnessFunction(IRGenModule &IGM,
     llvm::Value *value = getArg(argv, "value");
     getArgAsLocalSelfTypeMetadata(IGF, argv, abstractType);
 
-    if (strategy.getElementsWithPayload().size() > 0) {
-      strategy.destructiveProjectDataForLoad(
-          IGF, concreteType,
-          Address(value, type.getBestKnownAlignment()));
+    if (!strategy.getElementsWithPayload().empty()) {
+      if (auto *enumTypeLayoutEntry =
+              conditionallyGetEnumTypeLayoutEntry(IGM, concreteType)) {
+        enumTypeLayoutEntry->destructiveProjectEnumData(
+            IGF, Address(value, type.getBestKnownAlignment()));
+      } else {
+        strategy.destructiveProjectDataForLoad(
+            IGF, concreteType, Address(value, type.getBestKnownAlignment()));
+      }
     }
 
     IGF.Builder.CreateRetVoid();
@@ -621,10 +621,14 @@ static void buildValueWitnessFunction(IRGenModule &IGM,
     llvm::Value *tag = getArg(argv, "tag");
 
     getArgAsLocalSelfTypeMetadata(IGF, argv, abstractType);
-
-    strategy.emitStoreTag(IGF, concreteType,
-                          Address(value, type.getBestKnownAlignment()),
-                          tag);
+    if (auto *enumTypeLayoutEntry =
+            conditionallyGetEnumTypeLayoutEntry(IGM, concreteType)) {
+      enumTypeLayoutEntry->destructiveInjectEnumTag(
+          IGF, tag, Address(value, type.getBestKnownAlignment()));
+    } else {
+      strategy.emitStoreTag(IGF, concreteType,
+                            Address(value, type.getBestKnownAlignment()), tag);
+    }
 
     IGF.Builder.CreateRetVoid();
     return;
@@ -638,11 +642,18 @@ static void buildValueWitnessFunction(IRGenModule &IGM,
     llvm::Value *numEmptyCases = getArg(argv, "numEmptyCases");
 
     getArgAsLocalSelfTypeMetadata(IGF, argv, abstractType);
+    if (auto *typeLayoutEntry =
+            conditionallyGetTypeLayoutEntry(IGM, concreteType)) {
+      auto *idx = typeLayoutEntry->getEnumTagSinglePayload(
+          IGF, numEmptyCases, Address(value, type.getBestKnownAlignment()));
+      IGF.Builder.CreateRet(idx);
+    } else {
+      llvm::Value *idx = type.getEnumTagSinglePayload(
+          IGF, numEmptyCases, Address(value, type.getBestKnownAlignment()),
+          concreteType, true);
+      IGF.Builder.CreateRet(idx);
+    }
 
-    llvm::Value *idx = type.getEnumTagSinglePayload(
-        IGF, numEmptyCases, Address(value, type.getBestKnownAlignment()),
-        concreteType);
-    IGF.Builder.CreateRet(idx);
     return;
   }
 
@@ -655,18 +666,24 @@ static void buildValueWitnessFunction(IRGenModule &IGM,
     llvm::Value *numEmptyCases = getArg(argv, "numEmptyCases");
 
     getArgAsLocalSelfTypeMetadata(IGF, argv, abstractType);
-
-    type.storeEnumTagSinglePayload(IGF, whichCase, numEmptyCases,
-                                   Address(value, type.getBestKnownAlignment()),
-                                   concreteType);
+    if (auto *typeLayoutEntry =
+            conditionallyGetTypeLayoutEntry(IGM, concreteType)) {
+      typeLayoutEntry->storeEnumTagSinglePayload(
+          IGF, whichCase, numEmptyCases,
+          Address(value, type.getBestKnownAlignment()));
+    } else {
+      type.storeEnumTagSinglePayload(
+          IGF, whichCase, numEmptyCases,
+          Address(value, type.getBestKnownAlignment()), concreteType, true);
+    }
     IGF.Builder.CreateRetVoid();
     return;
   }
 
   case ValueWitness::Size:
   case ValueWitness::Flags:
+  case ValueWitness::ExtraInhabitantCount:
   case ValueWitness::Stride:
-  case ValueWitness::ExtraInhabitantFlags:
     llvm_unreachable("these value witnesses aren't functions");
   }
   llvm_unreachable("bad value witness kind!");
@@ -798,49 +815,18 @@ static llvm::Constant *getMemCpyFunction(IRGenModule &IGM,
   });
 }
 
-/// Return a function which takes two buffer arguments, copies
-/// a pointer from the second to the first, and returns the pointer.
-static llvm::Constant *
-getCopyOutOfLineBoxPointerFunction(IRGenModule &IGM,
-                                   const FixedTypeInfo &fixedTI) {
-  llvm::Type *argTys[] = { IGM.Int8PtrPtrTy, IGM.Int8PtrPtrTy,
-                           IGM.TypeMetadataPtrTy };
-  llvm::SmallString<40> name;
-  {
-    llvm::raw_svector_ostream nameStream(name);
-    nameStream << "__swift_copy_outline_existential_box_pointer";
-    nameStream << fixedTI.getFixedAlignment().getValue();
-  }
-  return IGM.getOrCreateHelperFunction(
-      name, IGM.Int8PtrTy, argTys, [&](IRGenFunction &IGF) {
-        auto it = IGF.CurFn->arg_begin();
-        Address dest(&*it++, IGM.getPointerAlignment());
-        Address src(&*it++, IGM.getPointerAlignment());
-        auto *ptr = IGF.Builder.CreateLoad(src);
-        IGF.Builder.CreateStore(ptr, dest);
-        auto *alignmentMask = fixedTI.getStaticAlignmentMask(IGM);
-        auto *heapHeaderSize = llvm::ConstantInt::get(
-            IGM.SizeTy, IGM.RefCountedStructSize.getValue());
-        auto *startOffset = IGF.Builder.CreateAnd(
-            IGF.Builder.CreateAdd(heapHeaderSize, alignmentMask),
-            IGF.Builder.CreateNot(alignmentMask));
-        auto *objectAddr =
-            IGF.emitByteOffsetGEP(ptr, startOffset, IGM.Int8Ty);
-        IGF.Builder.CreateRet(objectAddr);
-      });
-}
-
 /// Find a witness to the fact that a type is a value type.
 /// Always adds an i8*.
 static void addValueWitness(IRGenModule &IGM,
-                            ConstantArrayBuilder &B,
+                            ConstantStructBuilder &B,
                             ValueWitness index,
                             FixedPacking packing,
                             CanType abstractType,
                             SILType concreteType,
                             const TypeInfo &concreteTI) {
   auto addFunction = [&](llvm::Constant *fn) {
-    B.addBitCast(fn, IGM.Int8PtrTy);
+    fn = llvm::ConstantExpr::getBitCast(fn, IGM.Int8PtrTy);
+    B.addSignedPointer(fn, IGM.getOptions().PointerAuth.ValueWitnesses, index);
   };
 
   // Try to use a standard function.
@@ -860,17 +846,6 @@ static void addValueWitness(IRGenModule &IGM,
       } else if (concreteTI.isSingleSwiftRetainablePointer(ResilienceExpansion::Maximal)) {
         return addFunction(getInitWithCopyStrongFunction(IGM));
       }
-    }
-    goto standard;
-
-  case ValueWitness::InitializeBufferWithTakeOfBuffer:
-    if (packing == FixedPacking::Allocate) {
-      return addFunction(getCopyOutOfLineBoxPointerFunction(
-          IGM, cast<FixedTypeInfo>(concreteTI)));
-    } else
-      if (packing == FixedPacking::OffsetZero &&
-               concreteTI.isBitwiseTakable(ResilienceExpansion::Maximal)) {
-      return addFunction(getMemCpyFunction(IGM, concreteTI));
     }
     goto standard;
 
@@ -906,76 +881,52 @@ static void addValueWitness(IRGenModule &IGM,
 
   case ValueWitness::Size: {
     if (auto value = concreteTI.getStaticSize(IGM))
-      return B.add(llvm::ConstantExpr::getIntToPtr(value, IGM.Int8PtrTy));
+      return B.add(value);
 
-    // Just fill in null here if the type can't be statically laid out.
-    return B.add(llvm::ConstantPointerNull::get(IGM.Int8PtrTy));
+    // Just fill in 0 here if the type can't be statically laid out.
+    return B.addSize(Size(0));
   }
 
   case ValueWitness::Flags: {
-    uint64_t flags = 0;
+    ValueWitnessFlags flags;
 
     // If we locally know that the type has fixed layout, we can emit
     // meaningful flags for it.
     if (auto *fixedTI = dyn_cast<FixedTypeInfo>(&concreteTI)) {
-      flags |= fixedTI->getFixedAlignment().getValue() - 1;
-      if (!fixedTI->isPOD(ResilienceExpansion::Maximal))
-        flags |= ValueWitnessFlags::IsNonPOD;
       assert(packing == FixedPacking::OffsetZero ||
              packing == FixedPacking::Allocate);
-      if (packing != FixedPacking::OffsetZero)
-        flags |= ValueWitnessFlags::IsNonInline;
-
-      if (fixedTI->getFixedExtraInhabitantCount(IGM) > 0)
-        flags |= ValueWitnessFlags::Enum_HasExtraInhabitants;
-
-      if (!fixedTI->isBitwiseTakable(ResilienceExpansion::Maximal))
-        flags |= ValueWitnessFlags::IsNonBitwiseTakable;
+      bool isInline = packing == FixedPacking::OffsetZero;
+      bool isBitwiseTakable =
+          fixedTI->isBitwiseTakable(ResilienceExpansion::Maximal);
+      assert(isBitwiseTakable || !isInline);
+      flags = flags.withAlignment(fixedTI->getFixedAlignment().getValue())
+                  .withPOD(fixedTI->isPOD(ResilienceExpansion::Maximal))
+                  .withInlineStorage(isInline)
+                  .withBitwiseTakable(isBitwiseTakable);
+    } else {
+      flags = flags.withIncomplete(true);
     }
 
     if (concreteType.getEnumOrBoundGenericEnum())
-      flags |= ValueWitnessFlags::HasEnumWitnesses;
+      flags = flags.withEnumWitnesses(true);
 
-    auto value = IGM.getSize(Size(flags));
-    return B.add(llvm::ConstantExpr::getIntToPtr(value, IGM.Int8PtrTy));
+    return B.addInt32(flags.getOpaqueValue());
+  }
+
+  case ValueWitness::ExtraInhabitantCount: {
+    unsigned value = 0;
+    if (auto *fixedTI = dyn_cast<FixedTypeInfo>(&concreteTI)) {
+      value = fixedTI->getFixedExtraInhabitantCount(IGM);
+    }
+    return B.addInt32(value);
   }
 
   case ValueWitness::Stride: {
     if (auto value = concreteTI.getStaticStride(IGM))
-      return B.add(llvm::ConstantExpr::getIntToPtr(value, IGM.Int8PtrTy));
+      return B.add(value);
 
     // Just fill in null here if the type can't be statically laid out.
-    return B.add(llvm::ConstantPointerNull::get(IGM.Int8PtrTy));
-  }
-
-  case ValueWitness::StoreExtraInhabitant:
-  case ValueWitness::GetExtraInhabitantIndex: {
-    if (!concreteTI.mayHaveExtraInhabitants(IGM)) {
-      assert(concreteType.getEnumOrBoundGenericEnum());
-      return B.addNullPointer(IGM.Int8PtrTy);
-    }
-
-    goto standard;
-  }
-
-  case ValueWitness::ExtraInhabitantFlags: {
-    if (!concreteTI.mayHaveExtraInhabitants(IGM)) {
-      assert(concreteType.getEnumOrBoundGenericEnum());
-      return B.add(llvm::ConstantPointerNull::get(IGM.Int8PtrTy));
-    }
-
-    // If we locally know that the type has fixed layout, we can emit
-    // meaningful flags for it.
-    if (auto *fixedTI = dyn_cast<FixedTypeInfo>(&concreteTI)) {
-      uint64_t numExtraInhabitants = fixedTI->getFixedExtraInhabitantCount(IGM);
-      assert(numExtraInhabitants <= ExtraInhabitantFlags::NumExtraInhabitantsMask);
-      auto value = IGM.getSize(Size(numExtraInhabitants));
-      return B.add(llvm::ConstantExpr::getIntToPtr(value, IGM.Int8PtrTy));
-    }
-
-    // Otherwise, just fill in null here if the type can't be statically
-    // queried for extra inhabitants.
-    return B.add(llvm::ConstantPointerNull::get(IGM.Int8PtrTy));
+    return B.addSize(Size(0));
   }
 
   case ValueWitness::GetEnumTagSinglePayload:
@@ -1000,9 +951,21 @@ static void addValueWitness(IRGenModule &IGM,
   addFunction(fn);
 }
 
+static bool shouldAddEnumWitnesses(CanType abstractType) {
+  // Needs to handle UnboundGenericType.
+  return dyn_cast_or_null<EnumDecl>(abstractType.getAnyNominal()) != nullptr;
+}
+
+static llvm::StructType *getValueWitnessTableType(IRGenModule &IGM,
+                                                  CanType abstractType) {
+  return shouldAddEnumWitnesses(abstractType)
+           ? IGM.getEnumValueWitnessTableTy()
+           : IGM.getValueWitnessTableTy();
+}
+
 /// Collect the value witnesses for a particular type.
 static void addValueWitnesses(IRGenModule &IGM,
-                              ConstantArrayBuilder &B,
+                              ConstantStructBuilder &B,
                               FixedPacking packing,
                               CanType abstractType,
                               SILType concreteType,
@@ -1011,16 +974,7 @@ static void addValueWitnesses(IRGenModule &IGM,
     addValueWitness(IGM, B, ValueWitness(i), packing,
                     abstractType, concreteType, concreteTI);
   }
-  if (concreteType.getEnumOrBoundGenericEnum() ||
-      concreteTI.mayHaveExtraInhabitants(IGM)) {
-    for (auto i = unsigned(ValueWitness::First_ExtraInhabitantValueWitness);
-         i <= unsigned(ValueWitness::Last_ExtraInhabitantValueWitness);
-         ++i) {
-      addValueWitness(IGM, B, ValueWitness(i), packing,
-                      abstractType, concreteType, concreteTI);
-    }
-  }
-  if (concreteType.getEnumOrBoundGenericEnum()) {
+  if (shouldAddEnumWitnesses(abstractType)) {
     for (auto i = unsigned(ValueWitness::First_EnumValueWitness);
          i <= unsigned(ValueWitness::Last_EnumValueWitness);
          ++i) {
@@ -1038,7 +992,7 @@ bool irgen::hasDependentValueWitnessTable(IRGenModule &IGM, CanType ty) {
 }
 
 static void addValueWitnessesForAbstractType(IRGenModule &IGM,
-                                             ConstantArrayBuilder &B,
+                                             ConstantStructBuilder &B,
                                              CanType abstractType,
                                              bool &canBeConstant) {
   CanType concreteFormalType = getFormalTypeInContext(abstractType);
@@ -1055,26 +1009,156 @@ static void addValueWitnessesForAbstractType(IRGenModule &IGM,
                     concreteLoweredType, concreteTI);
 }
 
-/// Emit a value-witness table for the given type, which is assumed to
-/// be non-dependent.
-llvm::Constant *irgen::emitValueWitnessTable(IRGenModule &IGM,
-                                             CanType abstractType) {
-  // We shouldn't emit global value witness tables for generic type instances.
-  assert(!isa<BoundGenericType>(abstractType) &&
-         "emitting VWT for generic instance");
+static constexpr uint64_t sizeAndAlignment(Size size, Alignment alignment) {
+  return ((uint64_t)size.getValue() << 32) | alignment.getValue();
+}
+
+/// Return a reference to a known value witness table from the runtime
+/// that's suitable for the given type, if there is one, or return null
+/// if we should emit a new one.
+static ConstantReference
+getAddrOfKnownValueWitnessTable(IRGenModule &IGM, CanType type,
+                                bool relativeReference) {
+  // Native PE binaries shouldn't reference data symbols across DLLs, so disable
+  // this on Windows, unless we're forming a relative indirectable reference.
+  if (IGM.useDllStorage() && !relativeReference)
+    return {};
+  
+  if (auto nom = type->getAnyNominal()) {
+    // TODO: Non-C enums have extra inhabitants and also need additional value
+    // witnesses for their tag manipulation (except when they're empty, in
+    // which case values never exist to witness).
+    if (auto enumDecl = dyn_cast<EnumDecl>(nom))
+      if (!enumDecl->isObjC() && !type->isUninhabited())
+        return {};
+  }
+ 
+  auto &C = IGM.Context;
+
+  type = getFormalTypeInContext(type);
+  
+  auto &ti = IGM.getTypeInfoForUnlowered(AbstractionPattern::getOpaque(), type);
+
+  // We only have witnesses for fixed type info.
+  auto *fixedTI = dyn_cast<FixedTypeInfo>(&ti);
+  if (!fixedTI)
+    return {};
+
+  CanType witnessSurrogate;
+  ReferenceCounting refCounting;
+
+  // Empty types can use empty tuple witnesses.
+  if (ti.isKnownEmpty(ResilienceExpansion::Maximal)) {
+    witnessSurrogate = TupleType::getEmpty(C);
+  // Handle common POD type layouts.
+  } else if (fixedTI->isPOD(ResilienceExpansion::Maximal)
+      && fixedTI->getFixedExtraInhabitantCount(IGM) == 0) {
+    // Reuse one of the integer witnesses if applicable.
+    switch (sizeAndAlignment(fixedTI->getFixedSize(),
+                             fixedTI->getFixedAlignment())) {
+    case sizeAndAlignment(Size(0), Alignment::create<1>()):
+      witnessSurrogate = TupleType::getEmpty(C);
+      break;
+    case sizeAndAlignment(Size(1), Alignment::create<1>()):
+      witnessSurrogate = BuiltinIntegerType::get(8, C)->getCanonicalType();
+      break;
+    case sizeAndAlignment(Size(2), Alignment::create<2>()):
+      witnessSurrogate = BuiltinIntegerType::get(16, C)->getCanonicalType();
+      break;
+    case sizeAndAlignment(Size(4), Alignment::create<4>()):
+      witnessSurrogate = BuiltinIntegerType::get(32, C)->getCanonicalType();
+      break;
+    case sizeAndAlignment(Size(8), Alignment::create<8>()):
+      witnessSurrogate = BuiltinIntegerType::get(64, C)->getCanonicalType();
+      break;
+    case sizeAndAlignment(Size(16), Alignment::create<16>()):
+      witnessSurrogate = BuiltinIntegerType::get(128, C)->getCanonicalType();
+      break;
+    case sizeAndAlignment(Size(32), Alignment::create<32>()):
+      witnessSurrogate = BuiltinIntegerType::get(256, C)->getCanonicalType();
+      break;
+    case sizeAndAlignment(Size(64), Alignment::create<64>()):
+      witnessSurrogate = BuiltinIntegerType::get(512, C)->getCanonicalType();
+      break;
+    }
+  } else if (fixedTI->isSingleRetainablePointer(ResilienceExpansion::Maximal,
+                                                &refCounting)) {
+    switch (refCounting) {
+    case ReferenceCounting::Native:
+      witnessSurrogate = C.TheNativeObjectType;
+      break;
+    case ReferenceCounting::ObjC:
+    case ReferenceCounting::Block:
+    case ReferenceCounting::Unknown:
+      witnessSurrogate = C.getAnyObjectType();
+      break;
+    case ReferenceCounting::Bridge:
+      witnessSurrogate = C.TheBridgeObjectType;
+      break;
+    case ReferenceCounting::Error:
+      break;
+    }
+  }
+
+  if (witnessSurrogate) {
+    if (relativeReference) {
+      return IGM.getAddrOfLLVMVariableOrGOTEquivalent(
+                            LinkEntity::forValueWitnessTable(witnessSurrogate));
+    } else {
+      return {IGM.getAddrOfValueWitnessTable(witnessSurrogate),
+              ConstantReference::Direct};
+    }
+  }
+  return {};
+}
+
+llvm::Constant *
+IRGenModule::getAddrOfEffectiveValueWitnessTable(CanType concreteType,
+                                                 ConstantInit init) {
+  if (auto known =
+          getAddrOfKnownValueWitnessTable(*this, concreteType, false)) {
+    return known.getValue();
+  }
+  return getAddrOfValueWitnessTable(concreteType);
+}
+
+/// Emit a value-witness table for the given type.
+ConstantReference irgen::emitValueWitnessTable(IRGenModule &IGM,
+                                             CanType abstractType,
+                                             bool isPattern,
+                                             bool relativeReference) {
+  // See if we can use a prefab witness table from the runtime.
+  if (!isPattern) {
+    if (auto known = getAddrOfKnownValueWitnessTable(IGM, abstractType,
+                                                     relativeReference)) {
+      return known;
+    }
+  }
+  
+  // We should never be making a pattern if the layout isn't fixed.
+  // The reverse can be true for types whose layout depends on
+  // resilient types.
+  assert((!isPattern || hasDependentValueWitnessTable(IGM, abstractType)) &&
+         "emitting VWT pattern for fixed-layout type");
 
   ConstantInitBuilder builder(IGM);
-  auto witnesses = builder.beginArray(IGM.Int8PtrTy);
+  auto witnesses =
+    builder.beginStruct(getValueWitnessTableType(IGM, abstractType));
 
   bool canBeConstant = false;
   addValueWitnessesForAbstractType(IGM, witnesses, abstractType, canBeConstant);
+
+  // If this is just an instantiation pattern, we should never be modifying
+  // it in-place.
+  if (isPattern) canBeConstant = true;
 
   auto addr = IGM.getAddrOfValueWitnessTable(abstractType,
                                              witnesses.finishAndCreateFuture());
   auto global = cast<llvm::GlobalVariable>(addr);
   global->setConstant(canBeConstant);
 
-  return llvm::ConstantExpr::getBitCast(global, IGM.WitnessTablePtrTy);
+  return {llvm::ConstantExpr::getBitCast(global, IGM.WitnessTablePtrTy),
+          ConstantReference::Direct};
 }
 
 llvm::Constant *IRGenModule::emitFixedTypeLayout(CanType t,
@@ -1124,19 +1208,13 @@ llvm::Constant *IRGenModule::emitFixedTypeLayout(CanType t,
 
   // Emit the layout values.
   ConstantInitBuilder builder(*this);
-  auto witnesses = builder.beginArray(Int8PtrTy);
+  auto witnesses = builder.beginStruct();
   FixedPacking packing = ti.getFixedPacking(*this);
   for (auto witness = ValueWitness::First_TypeLayoutWitness;
        witness <= ValueWitness::Last_RequiredTypeLayoutWitness;
        witness = ValueWitness(unsigned(witness) + 1)) {
     addValueWitness(*this, witnesses, witness, packing, t, silTy, ti);
   }
-
-  if (ti.mayHaveExtraInhabitants(*this))
-    for (auto witness = ValueWitness::First_ExtraInhabitantValueWitness;
-         witness <= ValueWitness::Last_TypeLayoutWitness;
-         witness = ValueWitness(unsigned(witness) + 1))
-      addValueWitness(*this, witnesses, witness, packing, t, silTy, ti);
 
   auto layoutVar
     = witnesses.finishAndCreateGlobal(
@@ -1149,32 +1227,11 @@ llvm::Constant *IRGenModule::emitFixedTypeLayout(CanType t,
                                       /*constant*/ true,
                                       llvm::GlobalValue::PrivateLinkage);
 
-  auto zero = llvm::ConstantInt::get(Int32Ty, 0);
-  llvm::Constant *indices[] = {zero, zero};
-  auto layout = llvm::ConstantExpr::getGetElementPtr(layoutVar->getValueType(),
-                                                     layoutVar, indices);
+  // Cast to the standard currency type for type layouts.
+  auto layout = llvm::ConstantExpr::getBitCast(layoutVar, Int8PtrPtrTy);
 
   PrivateFixedLayouts.insert({key, layout});
   return layout;
-}
-
-/// Emit the elements of a dependent value witness table template into a
-/// vector.
-void irgen::emitDependentValueWitnessTablePattern(IRGenModule &IGM,
-                                                  ConstantStructBuilder &B,
-                                                  CanType abstractType) {
-  // We shouldn't emit global value witness tables for generic type instances.
-  assert(!isa<BoundGenericType>(abstractType) &&
-         "emitting VWT for generic instance");
-
-  // We shouldn't emit global value witness tables for fixed-layout types.
-  assert(hasDependentValueWitnessTable(IGM, abstractType) &&
-         "emitting VWT pattern for fixed-layout type");
-
-  bool canBeConstant = false;
-  auto witnesses = B.beginArray(IGM.Int8PtrTy);
-  addValueWitnessesForAbstractType(IGM, witnesses, abstractType, canBeConstant);
-  witnesses.finishAndAddTo(B);
 }
 
 FixedPacking TypeInfo::getFixedPacking(IRGenModule &IGM) const {
@@ -1185,6 +1242,10 @@ FixedPacking TypeInfo::getFixedPacking(IRGenModule &IGM) const {
   // allocated inline.
   if (!fixedTI)
     return FixedPacking::Dynamic;
+
+  // By convention we only store bitwise takable values inline.
+  if (!fixedTI->isBitwiseTakable(ResilienceExpansion::Maximal))
+    return FixedPacking::Allocate;
 
   Size bufferSize = getFixedBufferSize(IGM);
   Size requiredSize = fixedTI->getFixedSize();
@@ -1208,6 +1269,18 @@ FixedPacking TypeInfo::getFixedPacking(IRGenModule &IGM) const {
 
   // Otherwise we're stuck and have to separately allocate.
   return FixedPacking::Allocate;
+}
+
+bool TypeInfo::canValueWitnessExtraInhabitantsUpTo(IRGenModule &IGM,
+                                                   unsigned index) const {
+  // If this type is POD, then its value witnesses are trivial, so can handle
+  // any bit pattern.
+  if (isPOD(ResilienceExpansion::Maximal)) {
+    return true;
+  }
+  
+  // By default, assume that extra inhabitants must be branched out on.
+  return false;
 }
 
 Address TypeInfo::indexArray(IRGenFunction &IGF, Address base,
@@ -1279,8 +1352,10 @@ void TypeInfo::initializeArrayWithCopy(IRGenFunction &IGF,
   if (isPOD(ResilienceExpansion::Maximal)) {
     llvm::Value *stride = getStride(IGF, T);
     llvm::Value *byteCount = IGF.Builder.CreateNUWMul(stride, count);
-    IGF.Builder.CreateMemCpy(dest.getAddress(), src.getAddress(),
-                             byteCount, dest.getAlignment().getValue());
+    IGF.Builder.CreateMemCpy(
+        dest.getAddress(), llvm::MaybeAlign(dest.getAlignment().getValue()),
+        src.getAddress(), llvm::MaybeAlign(src.getAlignment().getValue()),
+        byteCount);
     return;
   }
 
@@ -1293,8 +1368,10 @@ void TypeInfo::initializeArrayWithTakeNoAlias(IRGenFunction &IGF, Address dest,
   if (isBitwiseTakable(ResilienceExpansion::Maximal)) {
     llvm::Value *stride = getStride(IGF, T);
     llvm::Value *byteCount = IGF.Builder.CreateNUWMul(stride, count);
-    IGF.Builder.CreateMemCpy(dest.getAddress(), src.getAddress(), byteCount,
-                             dest.getAlignment().getValue());
+    IGF.Builder.CreateMemCpy(
+        dest.getAddress(), llvm::MaybeAlign(dest.getAlignment().getValue()),
+        src.getAddress(), llvm::MaybeAlign(src.getAlignment().getValue()),
+        byteCount);
     return;
   }
 
@@ -1308,8 +1385,10 @@ const {
   if (isBitwiseTakable(ResilienceExpansion::Maximal)) {
     llvm::Value *stride = getStride(IGF, T);
     llvm::Value *byteCount = IGF.Builder.CreateNUWMul(stride, count);
-    IGF.Builder.CreateMemMove(dest.getAddress(), src.getAddress(),
-                              byteCount, dest.getAlignment().getValue());
+    IGF.Builder.CreateMemMove(
+        dest.getAddress(), llvm::MaybeAlign(dest.getAlignment().getValue()),
+        src.getAddress(), llvm::MaybeAlign(src.getAlignment().getValue()),
+        byteCount);
     return;
   }
 
@@ -1323,8 +1402,10 @@ const {
   if (isBitwiseTakable(ResilienceExpansion::Maximal)) {
     llvm::Value *stride = getStride(IGF, T);
     llvm::Value *byteCount = IGF.Builder.CreateNUWMul(stride, count);
-    IGF.Builder.CreateMemMove(dest.getAddress(), src.getAddress(),
-                              byteCount, dest.getAlignment().getValue());
+    IGF.Builder.CreateMemMove(
+        dest.getAddress(), llvm::MaybeAlign(dest.getAlignment().getValue()),
+        src.getAddress(), llvm::MaybeAlign(src.getAlignment().getValue()),
+        byteCount);
     return;
   }
 
@@ -1337,8 +1418,10 @@ void TypeInfo::assignArrayWithCopyNoAlias(IRGenFunction &IGF, Address dest,
   if (isPOD(ResilienceExpansion::Maximal)) {
     llvm::Value *stride = getStride(IGF, T);
     llvm::Value *byteCount = IGF.Builder.CreateNUWMul(stride, count);
-    IGF.Builder.CreateMemCpy(dest.getAddress(), src.getAddress(), byteCount,
-                             dest.getAlignment().getValue());
+    IGF.Builder.CreateMemCpy(
+        dest.getAddress(), llvm::MaybeAlign(dest.getAlignment().getValue()),
+        src.getAddress(), llvm::MaybeAlign(src.getAlignment().getValue()),
+        byteCount);
     return;
   }
 
@@ -1351,8 +1434,10 @@ void TypeInfo::assignArrayWithCopyFrontToBack(IRGenFunction &IGF, Address dest,
   if (isPOD(ResilienceExpansion::Maximal)) {
     llvm::Value *stride = getStride(IGF, T);
     llvm::Value *byteCount = IGF.Builder.CreateNUWMul(stride, count);
-    IGF.Builder.CreateMemMove(dest.getAddress(), src.getAddress(),
-                              byteCount, dest.getAlignment().getValue());
+    IGF.Builder.CreateMemMove(
+        dest.getAddress(), llvm::MaybeAlign(dest.getAlignment().getValue()),
+        src.getAddress(), llvm::MaybeAlign(src.getAlignment().getValue()),
+        byteCount);
     return;
   }
 
@@ -1365,8 +1450,10 @@ void TypeInfo::assignArrayWithCopyBackToFront(IRGenFunction &IGF, Address dest,
   if (isPOD(ResilienceExpansion::Maximal)) {
     llvm::Value *stride = getStride(IGF, T);
     llvm::Value *byteCount = IGF.Builder.CreateNUWMul(stride, count);
-    IGF.Builder.CreateMemMove(dest.getAddress(), src.getAddress(),
-                              byteCount, dest.getAlignment().getValue());
+    IGF.Builder.CreateMemMove(
+        dest.getAddress(), llvm::MaybeAlign(dest.getAlignment().getValue()),
+        src.getAddress(), llvm::MaybeAlign(src.getAlignment().getValue()),
+        byteCount);
     return;
   }
 
@@ -1379,10 +1466,19 @@ void TypeInfo::assignArrayWithTake(IRGenFunction &IGF, Address dest,
   if (isPOD(ResilienceExpansion::Maximal)) {
     llvm::Value *stride = getStride(IGF, T);
     llvm::Value *byteCount = IGF.Builder.CreateNUWMul(stride, count);
-    IGF.Builder.CreateMemCpy(dest.getAddress(), src.getAddress(), byteCount,
-                             dest.getAlignment().getValue());
+    IGF.Builder.CreateMemCpy(
+        dest.getAddress(), llvm::MaybeAlign(dest.getAlignment().getValue()),
+        src.getAddress(), llvm::MaybeAlign(src.getAlignment().getValue()),
+        byteCount);
     return;
   }
 
   emitAssignArrayWithTakeCall(IGF, T, dest, src, count);
+}
+
+void TypeInfo::collectMetadataForOutlining(OutliningMetadataCollector &c,
+                                           SILType T) const {
+  auto canType = T.getASTType();
+  assert(!canType->is<ArchetypeType>() && "Did not expect an ArchetypeType");
+  (void)canType;
 }

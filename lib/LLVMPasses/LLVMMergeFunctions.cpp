@@ -38,13 +38,11 @@
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/IR/Attributes.h"
-#include "llvm/IR/CallSite.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Instructions.h"
-#include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/ValueHandle.h"
@@ -75,7 +73,7 @@ static cl::opt<unsigned> FunctionMergeThreshold(
     "swiftmergefunc-threshold",
     cl::desc("Functions larger than the threshold are considered for merging."
              "'0' disables function merging at all."),
-    cl::init(30), cl::Hidden);
+    cl::init(15), cl::Hidden);
 
 namespace {
 
@@ -224,12 +222,6 @@ public:
   bool runOnModule(Module &M) override;
 
 private:
-  enum {
-    /// The maximum number of parameters added to a merged functions. This
-    /// roughly corresponds to the number of differing constants.
-    maxAddedParams = 4
-  };
-
   struct FunctionEntry;
 
   /// Describes the set of functions which are considered as "equivalent" (i.e.
@@ -263,7 +255,7 @@ private:
       return FCmp.compareIgnoringConsts() == -1;
     }
   };
-  typedef std::set<EquivalenceClass, FunctionNodeCmp> FnTreeType;
+  using FnTreeType = std::set<EquivalenceClass, FunctionNodeCmp>;
 
   /// 
   struct FunctionEntry {
@@ -312,7 +304,7 @@ private:
     /// Advances the current instruction to the next instruction.
     void nextInst() {
       assert(CurrentInst);
-      if (isa<TerminatorInst>(CurrentInst)) {
+      if (CurrentInst->isTerminator()) {
         auto BlockIter = std::next(CurrentInst->getParent()->getIterator());
         if (BlockIter == F->end()) {
           CurrentInst = nullptr;
@@ -334,7 +326,7 @@ private:
     int NumParamsNeeded;
   };
 
-  typedef SmallVector<FunctionInfo, 8> FunctionInfos;
+  using FunctionInfos = SmallVector<FunctionInfo, 8>;
 
   /// Describes a parameter which we create to parameterize the merged function.
   struct ParamInfo {
@@ -361,7 +353,7 @@ private:
     }
   };
 
-  typedef SmallVector<ParamInfo, maxAddedParams> ParamInfos;
+  using ParamInfos = SmallVector<ParamInfo, 16>;
 
   GlobalNumberState GlobalNumbers;
 
@@ -400,12 +392,15 @@ private:
 
   FunctionInfo removeFuncWithMostParams(FunctionInfos &FInfos);
 
-  bool deriveParams(ParamInfos &Params, FunctionInfos &FInfos);
+  bool deriveParams(ParamInfos &Params, FunctionInfos &FInfos,
+                    unsigned maxParams);
+
+  bool numOperandsDiffer(FunctionInfos &FInfos);
 
   bool constsDiffer(const FunctionInfos &FInfos, unsigned OpIdx);
 
   bool tryMapToParameter(FunctionInfos &FInfos, unsigned OpIdx,
-                         ParamInfos &Params);
+                         ParamInfos &Params, unsigned maxParams);
 
   void mergeWithParams(const FunctionInfos &FInfos, ParamInfos &Params);
 
@@ -460,8 +455,8 @@ bool SwiftMergeFunctions::doSanityCheck(std::vector<WeakTrackingVH> &Worklist) {
         if (Res1 != -Res2) {
           dbgs() << "MERGEFUNC-SANITY: Non-symmetric; triple: " << TripleNumber
                  << "\n";
-          F1->dump();
-          F2->dump();
+          LLVM_DEBUG(F1->dump());
+          LLVM_DEBUG(F2->dump());
           Valid = false;
         }
 
@@ -498,9 +493,9 @@ bool SwiftMergeFunctions::doSanityCheck(std::vector<WeakTrackingVH> &Worklist) {
                    << TripleNumber << "\n";
             dbgs() << "Res1, Res3, Res4: " << Res1 << ", " << Res3 << ", "
                    << Res4 << "\n";
-            F1->dump();
-            F2->dump();
-            F3->dump();
+            LLVM_DEBUG(F1->dump());
+            LLVM_DEBUG(F2->dump());
+            LLVM_DEBUG(F3->dump());
             Valid = false;
           }
         }
@@ -511,6 +506,42 @@ bool SwiftMergeFunctions::doSanityCheck(std::vector<WeakTrackingVH> &Worklist) {
     return Valid;
   }
   return true;
+}
+
+/// Returns true if functions containing calls to \p F may be merged together.
+static bool mayMergeCallsToFunction(Function &F) {
+  StringRef Name = F.getName();
+
+  // Calls to dtrace probes must generate unique patchpoints.
+  if (Name.startswith("__dtrace"))
+    return false;
+
+  return true;
+}
+
+/// Returns the benefit, which is approximately the size of the function.
+/// Return 0, if the function should not be merged.
+static unsigned getBenefit(Function *F) {
+  unsigned Benefit = 0;
+
+  // We don't want to merge very small functions, because the overhead of
+  // adding creating thunks and/or adding parameters to the call sites
+  // outweighs the benefit.
+  for (BasicBlock &BB : *F) {
+    for (Instruction &I : BB) {
+      if (CallBase *CB = dyn_cast<CallBase>(&I)) {
+        Function *Callee = CB->getCalledFunction();
+        if (Callee && !mayMergeCallsToFunction(*Callee))
+          return 0;
+        if (!Callee || !Callee->isIntrinsic()) {
+          Benefit += 5;
+          continue;
+        }
+      }
+      Benefit += 1;
+    }
+  }
+  return Benefit;
 }
 
 /// Returns true if function \p F is eligible for merging.
@@ -524,23 +555,7 @@ static bool isEligibleFunction(Function *F) {
   if (F->getFunctionType()->isVarArg())
     return false;
   
-  unsigned Benefit = 0;
-
-  // We don't want to merge very small functions, because the overhead of
-  // adding creating thunks and/or adding parameters to the call sites
-  // outweighs the benefit.
-  for (BasicBlock &BB : *F) {
-    for (Instruction &I : BB) {
-      if (CallSite CS = CallSite(&I)) {
-        Function *Callee = CS.getCalledFunction();
-        if (!Callee || !Callee->isIntrinsic()) {
-          Benefit += 5;
-          continue;
-        }
-      }
-      Benefit += 1;
-    }
-  }
+  unsigned Benefit = getBenefit(F);
   if (Benefit < FunctionMergeThreshold)
     return false;
   
@@ -595,9 +610,9 @@ bool SwiftMergeFunctions::runOnModule(Module &M) {
     std::vector<WeakTrackingVH> Worklist;
     Deferred.swap(Worklist);
 
-    DEBUG(dbgs() << "======\nbuild tree: worklist-size=" << Worklist.size() <<
-                    '\n');
-    DEBUG(doSanityCheck(Worklist));
+    LLVM_DEBUG(dbgs() << "======\nbuild tree: worklist-size="
+                      << Worklist.size() << '\n');
+    LLVM_DEBUG(doSanityCheck(Worklist));
 
     SmallVector<FunctionEntry *, 8> FuncsToMerge;
 
@@ -616,10 +631,10 @@ bool SwiftMergeFunctions::runOnModule(Module &M) {
 
       if (Result.second) {
         assert(Eq.First == FE);
-        DEBUG(dbgs() << "  new in tree: " << F->getName() << '\n');
+        LLVM_DEBUG(dbgs() << "  new in tree: " << F->getName() << '\n');
       } else {
         assert(Eq.First != FE);
-        DEBUG(dbgs() << "  add to existing: " << F->getName() << '\n');
+        LLVM_DEBUG(dbgs() << "  add to existing: " << F->getName() << '\n');
         // Add the function to the existing equivalence class.
         FE->Next = Eq.First->Next;
         Eq.First->Next = FE;
@@ -629,7 +644,8 @@ bool SwiftMergeFunctions::runOnModule(Module &M) {
           FuncsToMerge.push_back(Eq.First);
       }
     }
-    DEBUG(dbgs() << "merge functions: tree-size=" << FnTree.size() << '\n');
+    LLVM_DEBUG(dbgs() << "merge functions: tree-size=" << FnTree.size()
+                      << '\n');
 
     // Figure out the leaf functions. We want to do the merging in bottom-up
     // call order. This ensures that we don't parameterize on callee function
@@ -709,12 +725,17 @@ bool SwiftMergeFunctions::tryMergeEquivalenceClass(FunctionEntry *FirstInClass) 
   bool Changed = false;
   int Try = 0;
 
+  unsigned Benefit = getBenefit(FirstInClass->F);
+  
+  // The bigger the function, the more parameters are allowed.
+  unsigned maxParams = std::max(4u, Benefit / 100);
+
   // We need multiple tries if there are some functions in FInfos which differ
   // too much from the first function in FInfos. But we limit the number of
   // tries to a small number, because this is quadratic.
   while (FInfos.size() >= 2 && Try++ < 4) {
     ParamInfos Params;
-    bool Merged = deriveParams(Params, FInfos);
+    bool Merged = deriveParams(Params, FInfos, maxParams);
     if (Merged) {
       mergeWithParams(FInfos, Params);
       Changed = true;
@@ -753,7 +774,8 @@ removeFuncWithMostParams(FunctionInfos &FInfos) {
 /// Returns true on success, i.e. the functions in \p FInfos can be merged with
 /// the parameters returned in \p Params.
 bool SwiftMergeFunctions::deriveParams(ParamInfos &Params,
-                                       FunctionInfos &FInfos) {
+                                       FunctionInfos &FInfos,
+                                       unsigned maxParams) {
   for (FunctionInfo &FI : FInfos)
     FI.init();
 
@@ -762,13 +784,27 @@ bool SwiftMergeFunctions::deriveParams(ParamInfos &Params,
   // Iterate over all instructions synchronously in all functions.
   do {
     if (isEligibleForConstantSharing(FirstFI.CurrentInst)) {
+
+      // Here we handle a rare corner case which needs to be explained:
+      // Usually the number of operands match, because otherwise the functions
+      // in FInfos would not be in the same equivalence class. There is only one
+      // exception to that: If the current instruction is a call to a function,
+      // which was merged in the previous iteration (in tryMergeEquivalenceClass)
+      // then the call could be replaced and has more arguments than the
+      // original call.
+      if (numOperandsDiffer(FInfos)) {
+        assert(isa<CallInst>(FirstFI.CurrentInst) &&
+               "only calls are expected to differ in number of operands");
+        return false;
+      }
+
       for (unsigned OpIdx = 0, NumOps = FirstFI.CurrentInst->getNumOperands();
            OpIdx != NumOps; ++OpIdx) {
 
         if (constsDiffer(FInfos, OpIdx)) {
           // This instruction has operands which differ in at least some
           // functions. So we need to parameterize it.
-          if (!tryMapToParameter(FInfos, OpIdx, Params)) {
+          if (!tryMapToParameter(FInfos, OpIdx, Params, maxParams)) {
             // We ran out of parameters.
             return false;
           }
@@ -781,6 +817,16 @@ bool SwiftMergeFunctions::deriveParams(ParamInfos &Params,
   } while (FirstFI.CurrentInst);
 
   return true;
+}
+
+/// Returns true if the number of operands of the current instruction differs.
+bool SwiftMergeFunctions::numOperandsDiffer(FunctionInfos &FInfos) {
+  unsigned numOps = FInfos[0].CurrentInst->getNumOperands();
+  for (const FunctionInfo &FI : ArrayRef<FunctionInfo>(FInfos).drop_front(1)) {
+    if (FI.CurrentInst->getNumOperands() != numOps)
+      return true;
+  }
+  return false;
 }
 
 /// Returns true if the \p OpIdx's constant operand in the current instruction
@@ -807,7 +853,8 @@ bool SwiftMergeFunctions::constsDiffer(const FunctionInfos &FInfos,
 /// Returns true if a parameter could be created or found without exceeding the
 /// maximum number of parameters.
 bool SwiftMergeFunctions::tryMapToParameter(FunctionInfos &FInfos,
-                                            unsigned OpIdx, ParamInfos &Params) {
+                                            unsigned OpIdx, ParamInfos &Params,
+                                            unsigned maxParams) {
   ParamInfo *Matching = nullptr;
   // Try to find an existing parameter which exactly matches the differing
   // operands of the current instruction.
@@ -820,7 +867,7 @@ bool SwiftMergeFunctions::tryMapToParameter(FunctionInfos &FInfos,
   if (!Matching) {
     // We need a new parameter.
     // Check if we are within the limit.
-    if (Params.size() >= maxAddedParams)
+    if (Params.size() >= maxParams)
       return false;
 
     Params.resize(Params.size() + 1);
@@ -875,7 +922,7 @@ void SwiftMergeFunctions::mergeWithParams(const FunctionInfos &FInfos,
   FirstF->getParent()->getFunctionList().insert(
                         std::next(FInfos[1].F->getIterator()), NewFunction);
   
-  DEBUG(dbgs() << "  Merge into " << NewFunction->getName() << '\n');
+  LLVM_DEBUG(dbgs() << "  Merge into " << NewFunction->getName() << '\n');
 
   // Move the body of FirstF into the NewFunction.
   NewFunction->getBasicBlockList().splice(NewFunction->begin(),
@@ -917,7 +964,7 @@ void SwiftMergeFunctions::mergeWithParams(const FunctionInfos &FInfos,
       assert(!isInEquivalenceClass(&*Iter->second));
       Iter->second->F = nullptr;
       FuncEntries.erase(Iter);
-      DEBUG(dbgs() << "    Erase " << OrigFunc->getName() << '\n');
+      LLVM_DEBUG(dbgs() << "    Erase " << OrigFunc->getName() << '\n');
       OrigFunc->eraseFromParent();
     } else {
       // Otherwise we need a thunk which calls the merged function.
@@ -937,7 +984,8 @@ void SwiftMergeFunctions::removeEquivalenceClassFromTree(FunctionEntry *FE) {
   FunctionEntry *Unlink = Iter->First;
   Unlink->numUnhandledCallees = 0;
   while (Unlink) {
-    DEBUG(dbgs() << "    remove from tree: " << Unlink->F->getName() << '\n');
+    LLVM_DEBUG(dbgs() << "    remove from tree: " << Unlink->F->getName()
+                      << '\n');
     if (!Unlink->isMerged)
       Deferred.emplace_back(Unlink->F);
     Unlink->TreeIter = FnTree.end();
@@ -1016,7 +1064,7 @@ void SwiftMergeFunctions::writeThunk(Function *ToFunc, Function *Thunk,
     Builder.CreateRet(createCast(Builder, CI, Thunk->getReturnType()));
   }
 
-  DEBUG(dbgs() << "    writeThunk: " << Thunk->getName() << '\n');
+  LLVM_DEBUG(dbgs() << "    writeThunk: " << Thunk->getName() << '\n');
   ++NumSwiftThunksWritten;
 }
 
@@ -1039,7 +1087,7 @@ bool SwiftMergeFunctions::replaceDirectCallers(Function *Old, Function *New,
       removeEquivalenceClassFromTree(FE);
     
     auto *CI = dyn_cast<CallInst>(I);
-    if (!CI || CI->getCalledValue() != Old) {
+    if (!CI || CI->getCalledOperand() != Old) {
       AllReplaced = false;
       continue;
     }
@@ -1085,7 +1133,7 @@ bool SwiftMergeFunctions::replaceDirectCallers(Function *Old, Function *New,
                         cast<PointerType>(New->getType())->getAddressSpace());
 
     Value *Callee = ConstantExpr::getBitCast(New, FPtrType);
-    CallInst *NewCI = Builder.CreateCall(Callee, NewArgs);
+    CallInst *NewCI = Builder.CreateCall(FType, Callee, NewArgs);
     NewCI->setCallingConv(CI->getCallingConv());
     // Don't transfer attributes from the function to the callee. Function
     // attributes typically aren't relevant to the calling convention or ABI.
@@ -1098,4 +1146,3 @@ bool SwiftMergeFunctions::replaceDirectCallers(Function *Old, Function *New,
   assert(Old->use_empty() && "should have replaced all uses of old function");
   return Old->hasLocalLinkage();
 }
-

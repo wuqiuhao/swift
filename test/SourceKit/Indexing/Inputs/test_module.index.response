@@ -1,24 +1,21 @@
 {
-  key.hash: <hash>,
   key.dependencies: [
     {
       key.kind: source.lang.swift.import.module.swift,
       key.name: "Swift",
       key.filepath: Swift.swiftmodule,
-      key.hash: <hash>,
       key.is_system: 1
     },
     {
       key.kind: source.lang.swift.import.module.swift,
       key.name: "SwiftOnoneSupport",
       key.filepath: SwiftOnoneSupport.swiftmodule,
-      key.hash: <hash>,
+      key.is_system: 1,
       key.dependencies: [
         {
           key.kind: source.lang.swift.import.module.swift,
           key.name: "Swift",
           key.filepath: Swift.swiftmodule,
-          key.hash: <hash>,
           key.is_system: 1
         }
       ]
@@ -27,14 +24,63 @@
   key.entities: [
     {
       key.kind: source.lang.swift.decl.class,
-      key.name: "C2",
-      key.usr: "s:11test_module2C2C",
+      key.name: "Empty",
+      key.usr: "s:11test_module5EmptyC",
+      key.effective_access: source.decl.effective_access.public
+    },
+    {
+      key.kind: source.lang.swift.decl.class,
+      key.name: "TwoInts",
+      key.usr: "s:11test_module7TwoIntsC",
       key.entities: [
         {
+          key.kind: source.lang.swift.decl.var.instance,
+          key.name: "x",
+          key.usr: "s:11test_module7TwoIntsC1xSivp",
+          key.entities: [
+            {
+              key.kind: source.lang.swift.decl.function.accessor.getter,
+              key.usr: "s:11test_module7TwoIntsC1xSivg",
+              key.is_dynamic: 1,
+              key.is_implicit: 1
+            },
+            {
+              key.kind: source.lang.swift.decl.function.accessor.setter,
+              key.usr: "s:11test_module7TwoIntsC1xSivs",
+              key.is_dynamic: 1,
+              key.is_implicit: 1
+            }
+          ],
+          key.effective_access: source.decl.effective_access.public
+        },
+        {
+          key.kind: source.lang.swift.decl.var.instance,
+          key.name: "y",
+          key.usr: "s:11test_module7TwoIntsC1ySivp",
+          key.entities: [
+            {
+              key.kind: source.lang.swift.decl.function.accessor.getter,
+              key.usr: "s:11test_module7TwoIntsC1ySivg",
+              key.is_dynamic: 1,
+              key.is_implicit: 1
+            },
+            {
+              key.kind: source.lang.swift.decl.function.accessor.setter,
+              key.usr: "s:11test_module7TwoIntsC1ySivs",
+              key.is_dynamic: 1,
+              key.is_implicit: 1
+            }
+          ],
+          key.effective_access: source.decl.effective_access.public
+        },
+        {
           key.kind: source.lang.swift.decl.function.constructor,
-          key.usr: "s:11test_module2C2CACycfc"
+          key.name: "init(a:b:)",
+          key.usr: "s:11test_module7TwoIntsC1a1bACSi_Sitcfc",
+          key.effective_access: source.decl.effective_access.public
         }
-      ]
+      ],
+      key.effective_access: source.decl.effective_access.public
     },
     {
       key.kind: source.lang.swift.decl.class,
@@ -58,18 +104,17 @@
               key.usr: "s:11test_module16ComputedPropertyC5valueSivs",
               key.is_dynamic: 1
             }
-          ]
-        },
-        {
-          key.kind: source.lang.swift.decl.function.constructor,
-          key.usr: "s:11test_module16ComputedPropertyCACycfc"
+          ],
+          key.effective_access: source.decl.effective_access.public
         }
-      ]
+      ],
+      key.effective_access: source.decl.effective_access.public
     },
     {
       key.kind: source.lang.swift.decl.protocol,
       key.name: "Prot1",
-      key.usr: "s:11test_module5Prot1P"
+      key.usr: "s:11test_module5Prot1P",
+      key.effective_access: source.decl.effective_access.public
     },
     {
       key.kind: source.lang.swift.decl.protocol,
@@ -81,74 +126,20 @@
           key.name: "Prot1",
           key.usr: "s:11test_module5Prot1P"
         }
-      ]
-    },
-    {
-      key.kind: source.lang.swift.decl.class,
-      key.name: "TwoInts",
-      key.usr: "s:11test_module7TwoIntsC",
-      key.entities: [
-        {
-          key.kind: source.lang.swift.decl.var.instance,
-          key.name: "x",
-          key.usr: "s:11test_module7TwoIntsC1xSivp",
-          key.entities: [
-            {
-              key.kind: source.lang.swift.decl.function.accessor.getter,
-              key.usr: "s:11test_module7TwoIntsC1xSivg",
-              key.is_dynamic: 1
-            },
-            {
-              key.kind: source.lang.swift.decl.function.accessor.setter,
-              key.usr: "s:11test_module7TwoIntsC1xSivs",
-              key.is_dynamic: 1
-            }
-          ]
-        },
-        {
-          key.kind: source.lang.swift.decl.var.instance,
-          key.name: "y",
-          key.usr: "s:11test_module7TwoIntsC1ySivp",
-          key.entities: [
-            {
-              key.kind: source.lang.swift.decl.function.accessor.getter,
-              key.usr: "s:11test_module7TwoIntsC1ySivg",
-              key.is_dynamic: 1
-            },
-            {
-              key.kind: source.lang.swift.decl.function.accessor.setter,
-              key.usr: "s:11test_module7TwoIntsC1ySivs",
-              key.is_dynamic: 1
-            }
-          ]
-        },
-        {
-          key.kind: source.lang.swift.decl.function.constructor,
-          key.name: "init(a:b:)",
-          key.usr: "s:11test_module7TwoIntsCACSi1a_Si1btcfc"
-        }
-      ]
+      ],
+      key.effective_access: source.decl.effective_access.public
     },
     {
       key.kind: source.lang.swift.decl.protocol,
       key.name: "Prot3",
-      key.usr: "s:11test_module5Prot3P"
-    },
-    {
-      key.kind: source.lang.swift.decl.function.free,
-      key.name: "globalFunc()",
-      key.usr: "s:11test_module10globalFuncyyF"
+      key.usr: "s:11test_module5Prot3P",
+      key.effective_access: source.decl.effective_access.public
     },
     {
       key.kind: source.lang.swift.decl.class,
-      key.name: "Empty",
-      key.usr: "s:11test_module5EmptyC",
-      key.entities: [
-        {
-          key.kind: source.lang.swift.decl.function.constructor,
-          key.usr: "s:11test_module5EmptyCACycfc"
-        }
-      ]
+      key.name: "C2",
+      key.usr: "s:11test_module2C2C",
+      key.effective_access: source.decl.effective_access.public
     },
     {
       key.kind: source.lang.swift.decl.extension.class,
@@ -171,6 +162,17 @@
           key.usr: "s:11test_module5Prot2P"
         }
       ]
+    },
+    {
+      key.kind: source.lang.swift.decl.function.free,
+      key.name: "globalFunc()",
+      key.usr: "s:11test_module10globalFuncyyF",
+      key.effective_access: source.decl.effective_access.public
+    },
+    {
+      key.kind: source.lang.swift.decl.extension.class,
+      key.name: "C2",
+      key.usr: "s:e:s:11test_module2C2C6SECRETyyF"
     }
   ]
 }

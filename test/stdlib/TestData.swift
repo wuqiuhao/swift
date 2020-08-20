@@ -1,3 +1,4 @@
+
 // Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
@@ -10,11 +11,11 @@
 //
 // RUN: %target-clang %S/Inputs/FoundationBridge/FoundationBridge.m -c -o %t/FoundationBridgeObjC.o -g
 // RUN: %target-build-swift %s -I %S/Inputs/FoundationBridge/ -Xlinker %t/FoundationBridgeObjC.o -o %t/TestData
+// RUN: %target-codesign %t/TestData
 
 // RUN: %target-run %t/TestData
 // REQUIRES: executable_test
 // REQUIRES: objc_interop
-// UNSUPPORTED: resilient_stdlib
 
 import Foundation
 import Dispatch
@@ -237,6 +238,68 @@ class TestData : TestDataSuper {
         let data3 = Data(bytes: [1, 2, 3, 4, 5][1..<3])
         expectEqual(2, data3.count)
     }
+
+    func testInitializationWithBufferPointer() {
+        let nilBuffer = UnsafeBufferPointer<UInt8>(start: nil, count: 0)
+        let data = Data(buffer: nilBuffer)
+        expectEqual(data, Data())
+
+        let validPointer = UnsafeMutablePointer<UInt8>.allocate(capacity: 2)
+        validPointer[0] = 0xCA
+        validPointer[1] = 0xFE
+        defer { validPointer.deallocate() }
+
+        let emptyBuffer = UnsafeBufferPointer<UInt8>(start: validPointer, count: 0)
+        let data2 = Data(buffer: emptyBuffer)
+        expectEqual(data2, Data())
+
+        let shortBuffer = UnsafeBufferPointer<UInt8>(start: validPointer, count: 1)
+        let data3 = Data(buffer: shortBuffer)
+        expectEqual(data3, Data([0xCA]))
+
+        let fullBuffer = UnsafeBufferPointer<UInt8>(start: validPointer, count: 2)
+        let data4 = Data(buffer: fullBuffer)
+        expectEqual(data4, Data([0xCA, 0xFE]))
+
+        let tuple: (UInt16, UInt16, UInt16, UInt16) = (0xFF, 0xFE, 0xFD, 0xFC)
+        withUnsafeBytes(of: tuple) {
+            // If necessary, port this to big-endian.
+            let tupleBuffer: UnsafeBufferPointer<UInt8> = $0.bindMemory(to: UInt8.self)
+            let data5 = Data(buffer: tupleBuffer)
+            expectEqual(data5, Data([0xFF, 0x00, 0xFE, 0x00, 0xFD, 0x00, 0xFC, 0x00]))
+        }
+    }
+
+    func testInitializationWithMutableBufferPointer() {
+        let nilBuffer = UnsafeMutableBufferPointer<UInt8>(start: nil, count: 0)
+        let data = Data(buffer: nilBuffer)
+        expectEqual(data, Data())
+
+        let validPointer = UnsafeMutablePointer<UInt8>.allocate(capacity: 2)
+        validPointer[0] = 0xCA
+        validPointer[1] = 0xFE
+        defer { validPointer.deallocate() }
+
+        let emptyBuffer = UnsafeMutableBufferPointer<UInt8>(start: validPointer, count: 0)
+        let data2 = Data(buffer: emptyBuffer)
+        expectEqual(data2, Data())
+
+        let shortBuffer = UnsafeMutableBufferPointer<UInt8>(start: validPointer, count: 1)
+        let data3 = Data(buffer: shortBuffer)
+        expectEqual(data3, Data([0xCA]))
+
+        let fullBuffer = UnsafeMutableBufferPointer<UInt8>(start: validPointer, count: 2)
+        let data4 = Data(buffer: fullBuffer)
+        expectEqual(data4, Data([0xCA, 0xFE]))
+
+        var tuple: (UInt16, UInt16, UInt16, UInt16) = (0xFF, 0xFE, 0xFD, 0xFC)
+        withUnsafeMutableBytes(of: &tuple) {
+            // If necessary, port this to big-endian.
+            let tupleBuffer: UnsafeMutableBufferPointer<UInt8> = $0.bindMemory(to: UInt8.self)
+            let data5 = Data(buffer: tupleBuffer)
+            expectEqual(data5, Data([0xFF, 0x00, 0xFE, 0x00, 0xFD, 0x00, 0xFC, 0x00]))
+        }
+    }
     
     func testMutableData() {
         let hello = dataFrom("hello")
@@ -257,8 +320,7 @@ class TestData : TestDataSuper {
             // Mutate it
             bytes.pointee = 0x67
             expectEqual(bytes.pointee, 0x67, "First byte should be 0x67")
-            expectEqual(mutatingHello[0], 0x67, "First byte accessed via other method should still be 0x67")
-            
+
             // Verify that the first data is still correct
             expectEqual(hello[0], 0x68, "The first byte should still be 0x68")
         }
@@ -283,7 +345,6 @@ class TestData : TestDataSuper {
             // Mutate the second data
             bytes.pointee = 0
             expectEqual(bytes.pointee, 0, "First byte should be 0")
-            expectEqual(allOnesCopyToMutate[0], 0, "First byte accessed via other method should still be 0")
             
             // Verify that the first data is still 1
             expectEqual(allOnesData[0], 1, "The first byte should still be 1")
@@ -674,12 +735,6 @@ class TestData : TestDataSuper {
         expectEqual("SGVsbG8gV29ybGQ=", base64, "trivial base64 conversion should work")
     }
 
-    func test_dataHash() {
-        let dataStruct = "Hello World".data(using: .utf8)!
-        let dataObj = dataStruct as NSData
-        expectEqual(dataObj.hashValue, dataStruct.hashValue, "Data and NSData should have the same hash value")
-    }
-
     func test_base64Data_medium() {
         let data = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Ut at tincidunt arcu. Suspendisse nec sodales erat, sit amet imperdiet ipsum. Etiam sed ornare felis. Nunc mauris turpis, bibendum non lectus quis, malesuada placerat turpis. Nam adipiscing non massa et semper. Nulla convallis semper bibendum. Aliquam dictum nulla cursus mi ultricies, at tincidunt mi sagittis. Nulla faucibus at dui quis sodales. Morbi rutrum, dui id ultrices venenatis, arcu urna egestas felis, vel suscipit mauris arcu quis risus. Nunc venenatis ligula at orci tristique, et mattis purus pulvinar. Etiam ultricies est odio. Nunc eleifend malesuada justo, nec euismod sem ultrices quis. Etiam nec nibh sit amet lorem faucibus dapibus quis nec leo. Praesent sit amet mauris vel lacus hendrerit porta mollis consectetur mi. Donec eget tortor dui. Morbi imperdiet, arcu sit amet elementum interdum, quam nisl tempor quam, vitae feugiat augue purus sed lacus. In ac urna adipiscing purus venenatis volutpat vel et metus. Nullam nec auctor quam. Phasellus porttitor felis ac nibh gravida suscipit tempus at ante. Nunc pellentesque iaculis sapien a mattis. Aenean eleifend dolor non nunc laoreet, non dictum massa aliquam. Aenean quis turpis augue. Praesent augue lectus, mollis nec elementum eu, dignissim at velit. Ut congue neque id ullamcorper pellentesque. Maecenas euismod in elit eu vehicula. Nullam tristique dui nulla, nec convallis metus suscipit eget. Cras semper augue nec cursus blandit. Nulla rhoncus et odio quis blandit. Praesent lobortis dignissim velit ut pulvinar. Duis interdum quam adipiscing dolor semper semper. Nunc bibendum convallis dui, eget mollis magna hendrerit et. Morbi facilisis, augue eu fringilla convallis, mauris est cursus dolor, eu posuere odio nunc quis orci. Ut eu justo sem. Phasellus ut erat rhoncus, faucibus arcu vitae, vulputate erat. Aliquam nec magna viverra, interdum est vitae, rhoncus sapien. Duis tincidunt tempor ipsum ut dapibus. Nullam commodo varius metus, sed sollicitudin eros. Etiam nec odio et dui tempor blandit posuere.".data(using: .utf8)!
         let base64 = data.base64EncodedString()
@@ -806,14 +861,6 @@ class TestData : TestDataSuper {
         object.verifier.reset()
         expectTrue(data.count == object.length)
         expectFalse(object.verifier.wasCopied, "Expected an invocation to copy")
-
-        object.verifier.reset()
-        data.append("test", count: 4)
-        expectTrue(object.verifier.wasMutableCopied, "Expected an invocation to mutableCopy")
-
-        let d = data as NSData
-        let preservedObjectness = d is ImmutableDataVerifier
-        expectTrue(preservedObjectness, "Expected ImmutableDataVerifier but got \(object_getClass(d))")
     }
 
     func test_basicMutableDataMutation() {
@@ -827,20 +874,6 @@ class TestData : TestDataSuper {
         object.verifier.reset()
         expectTrue(data.count == object.length)
         expectFalse(object.verifier.wasCopied, "Expected an invocation to copy")
-        
-        object.verifier.reset()
-        data.append("test", count: 4)
-        expectTrue(object.verifier.wasMutableCopied, "Expected an invocation to mutableCopy")
-        object.verifier.dump()
-
-        let d = data as NSData
-        let preservedObjectness = d is ImmutableDataVerifier
-        expectTrue(preservedObjectness, "Expected ImmutableDataVerifier but got \(object_getClass(d))")
-    }
-
-    func test_roundTrip() {
-        let data = returnsData()
-        expectTrue(identityOfData(data))
     }
 
     func test_passing() {
@@ -967,12 +1000,13 @@ class TestData : TestDataSuper {
     }
 
     func test_noCopyBehavior() {
-        let ptr = UnsafeMutableRawPointer(bitPattern: 0x1)!
+        let ptr = UnsafeMutableRawPointer.allocate(byteCount: 17, alignment: 1)
         
         var deallocated = false
         autoreleasepool {
-            let data = Data(bytesNoCopy: ptr, count: 1, deallocator: .custom({ (bytes, length) in
+            let data = Data(bytesNoCopy: ptr, count: 17, deallocator: .custom({ (bytes, length) in
                 deallocated = true
+                ptr.deallocate()
             }))
             expectFalse(deallocated)
             let equal = data.withUnsafeBytes { (bytes: UnsafePointer<UInt8>) -> Bool in
@@ -981,7 +1015,6 @@ class TestData : TestDataSuper {
             
             expectTrue(equal)
         }
-        
         expectTrue(deallocated)
     }
 
@@ -1014,10 +1047,6 @@ class TestData : TestDataSuper {
         for i in 0..<d.count {
             for j in i..<d.count {
                 let slice = d[i..<j]
-                if i == 1 && j == 2 {
-                    print("here")
-                    
-                }
                 expectEqual(slice.count, j - i, "where index range is \(i)..<\(j)")
                 expectEqual(slice.map { $0 }, a[i..<j].map { $0 }, "where index range is \(i)..<\(j)")
                 expectEqual(slice.startIndex, i, "where index range is \(i)..<\(j)")
@@ -1032,10 +1061,10 @@ class TestData : TestDataSuper {
     }
 
     func test_rangeZoo() {
-        let r1 = Range(0..<1)
-        let r2 = CountableRange(0..<1)
+        let r1: Range = 0..<1
+        let r2: Range = 0..<1
         let r3 = ClosedRange(0..<1)
-        let r4 = CountableClosedRange(0..<1)
+        let r4 = ClosedRange(0..<1)
 
         let data = Data(bytes: [8, 1, 2, 3, 4])
         let slice1: Data = data[r1]
@@ -1046,6 +1075,99 @@ class TestData : TestDataSuper {
         expectEqual(slice2[0], 8)
         expectEqual(slice3[0], 8)
         expectEqual(slice4[0], 8)
+    }
+
+    func test_rangeOfDataProtocol() {
+        // https://bugs.swift.org/browse/SR-10689
+        
+        let base = Data([0x00, 0x01, 0x02, 0x03, 0x00, 0x01, 0x02, 0x03,
+                         0x00, 0x01, 0x02, 0x03, 0x00, 0x01, 0x02, 0x03])
+        let subdata = base[10..<13] // [0x02, 0x03, 0x00]
+        let oneByte = base[14..<15] // [0x02]
+        
+        do { // firstRange(of:in:)
+            func assertFirstRange(_ data: Data, _ fragment: Data, range: ClosedRange<Int>? = nil,
+                                  expectedStartIndex: Int?,
+                                  _ message: @autoclosure () -> String = "",
+                                  file: String = #file, line: UInt = #line) {
+                if let index = expectedStartIndex {
+                    let expectedRange: Range<Int> = index..<(index + fragment.count)
+                    if let someRange = range {
+                        expectEqual(data.firstRange(of: fragment, in: someRange), expectedRange, message(), file: file, line: line)
+                    } else {
+                        expectEqual(data.firstRange(of: fragment), expectedRange, message(), file: file, line: line)
+                    }
+                } else {
+                    if let someRange = range {
+                        expectNil(data.firstRange(of: fragment, in: someRange), message(), file: file, line: line)
+                    } else {
+                        expectNil(data.firstRange(of: fragment), message(), file: file, line: line)
+                    }
+                }
+            }
+            
+            assertFirstRange(base, base, expectedStartIndex: base.startIndex)
+            assertFirstRange(base, subdata, expectedStartIndex: 2)
+            assertFirstRange(base, oneByte, expectedStartIndex: 2)
+            
+            assertFirstRange(subdata, base, expectedStartIndex: nil)
+            assertFirstRange(subdata, subdata, expectedStartIndex: subdata.startIndex)
+            assertFirstRange(subdata, oneByte, expectedStartIndex: subdata.startIndex)
+            
+            assertFirstRange(oneByte, base, expectedStartIndex: nil)
+            assertFirstRange(oneByte, subdata, expectedStartIndex: nil)
+            assertFirstRange(oneByte, oneByte, expectedStartIndex: oneByte.startIndex)
+            
+            assertFirstRange(base, subdata, range: 1...14, expectedStartIndex: 2)
+            assertFirstRange(base, subdata, range: 6...8, expectedStartIndex: 6)
+            assertFirstRange(base, subdata, range: 8...10, expectedStartIndex: nil)
+            
+            assertFirstRange(base, oneByte, range: 1...14, expectedStartIndex: 2)
+            assertFirstRange(base, oneByte, range: 6...6, expectedStartIndex: 6)
+            assertFirstRange(base, oneByte, range: 8...9, expectedStartIndex: nil)
+        }
+        
+        do { // lastRange(of:in:)
+            func assertLastRange(_ data: Data, _ fragment: Data, range: ClosedRange<Int>? = nil,
+                                 expectedStartIndex: Int?,
+                                 _ message: @autoclosure () -> String = "",
+                                 file: String = #file, line: UInt = #line) {
+                if let index = expectedStartIndex {
+                    let expectedRange: Range<Int> = index..<(index + fragment.count)
+                    if let someRange = range {
+                        expectEqual(data.lastRange(of: fragment, in: someRange), expectedRange, message(), file: file, line: line)
+                    } else {
+                        expectEqual(data.lastRange(of: fragment), expectedRange, message(), file: file, line: line)
+                    }
+                } else {
+                  if let someRange = range {
+                      expectNil(data.lastRange(of: fragment, in: someRange), message(), file: file, line: line)
+                  } else {
+                      expectNil(data.lastRange(of: fragment), message(), file: file, line: line)
+                  }
+                }
+            }
+            
+            assertLastRange(base, base, expectedStartIndex: base.startIndex)
+            assertLastRange(base, subdata, expectedStartIndex: 10)
+            assertLastRange(base, oneByte, expectedStartIndex: 14)
+            
+            assertLastRange(subdata, base, expectedStartIndex: nil)
+            assertLastRange(subdata, subdata, expectedStartIndex: subdata.startIndex)
+            assertLastRange(subdata, oneByte, expectedStartIndex: subdata.startIndex)
+            
+            assertLastRange(oneByte, base, expectedStartIndex: nil)
+            assertLastRange(oneByte, subdata, expectedStartIndex: nil)
+            assertLastRange(oneByte, oneByte, expectedStartIndex: oneByte.startIndex)
+            
+            assertLastRange(base, subdata, range: 1...14, expectedStartIndex: 10)
+            assertLastRange(base, subdata, range: 6...8, expectedStartIndex: 6)
+            assertLastRange(base, subdata, range: 8...10, expectedStartIndex: nil)
+            
+            assertLastRange(base, oneByte, range: 1...14, expectedStartIndex: 14)
+            assertLastRange(base, oneByte, range: 6...6, expectedStartIndex: 6)
+            assertLastRange(base, oneByte, range: 8...9, expectedStartIndex: nil)
+        }
     }
 
     func test_sliceAppending() {
@@ -1216,6 +1338,55 @@ class TestData : TestDataSuper {
         expectEqual(Data(bytes: [1]), slice)
     }
 
+    // This test uses `repeatElement` to produce a sequence -- the produced sequence reports its actual count as its `.underestimatedCount`.
+    func test_appendingNonContiguousSequence_exactCount() {
+        var d = Data()
+
+        // d should go from .empty representation to .inline.
+        // Appending a small enough sequence to fit in .inline should actually be copied.
+        d.append(contentsOf: 0x00...0x01)
+        expectEqual(Data([0x00, 0x01]), d)
+
+        // Appending another small sequence should similarly still work.
+        d.append(contentsOf: 0x02...0x02)
+        expectEqual(Data([0x00, 0x01, 0x02]), d)
+
+        // If we append a sequence of elements larger than a single InlineData, the internal append here should buffer.
+        // We want to make sure that buffering in this way does not accidentally drop trailing elements on the floor.
+        d.append(contentsOf: 0x03...0x2F)
+        expectEqual(Data([0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                          0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+                          0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+                          0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
+                          0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+                          0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F]), d)
+    }
+
+    // This test is like test_appendingNonContiguousSequence_exactCount but uses a sequence which reports 0 for its `.underestimatedCount`.
+    // This attempts to hit the worst-case scenario of `Data.append<S>(_:)` -- a discontiguous sequence of unknown length.
+    func test_appendingNonContiguousSequence_underestimatedCount() {
+        var d = Data()
+
+        // d should go from .empty representation to .inline.
+        // Appending a small enough sequence to fit in .inline should actually be copied.
+        d.append(contentsOf: (0x00...0x01).makeIterator()) // `.makeIterator()` produces a sequence whose `.underestimatedCount` is 0.
+        expectEqual(Data([0x00, 0x01]), d)
+
+        // Appending another small sequence should similarly still work.
+        d.append(contentsOf: (0x02...0x02).makeIterator()) // `.makeIterator()` produces a sequence whose `.underestimatedCount` is 0.
+        expectEqual(Data([0x00, 0x01, 0x02]), d)
+
+        // If we append a sequence of elements larger than a single InlineData, the internal append here should buffer.
+        // We want to make sure that buffering in this way does not accidentally drop trailing elements on the floor.
+        d.append(contentsOf: (0x03...0x2F).makeIterator()) // `.makeIterator()` produces a sequence whose `.underestimatedCount` is 0.
+        expectEqual(Data([0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                          0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+                          0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+                          0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
+                          0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+                          0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F]), d)
+    }
+
     func test_sequenceInitializers() {
         let seq = repeatElement(UInt8(0x02), count: 3) // ensure we fall into the sequence case
         
@@ -1348,9 +1519,9 @@ class TestData : TestDataSuper {
         expectEqual(data, Data(bytes: [0, 1, 2, 3, 0xFF, 0xFF, 9]))
     }
     
-    func test_validateMutation_replaceSubrangeCountableRange() {
+    func test_validateMutation_replaceSubrangeRange() {
         var data = Data(bytes: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
-        let range: CountableRange<Data.Index> = data.startIndex.advanced(by: 4)..<data.startIndex.advanced(by: 9)
+        let range: Range<Data.Index> = data.startIndex.advanced(by: 4)..<data.startIndex.advanced(by: 9)
         let replacement = Data(bytes: [0xFF, 0xFF])
         data.replaceSubrange(range, with: replacement)
         expectEqual(data, Data(bytes: [0, 1, 2, 3, 0xFF, 0xFF, 9]))
@@ -1441,9 +1612,9 @@ class TestData : TestDataSuper {
         expectEqual(data, Data(bytes: [4, 0xFF, 0xFF, 8]))
     }
     
-    func test_validateMutation_slice_replaceSubrangeCountableRange() {
+    func test_validateMutation_slice_replaceSubrangeRange() {
         var data = Data(bytes: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9])[4..<9]
-        let range: CountableRange<Data.Index> = data.startIndex.advanced(by: 1)..<data.endIndex.advanced(by: -1)
+        let range: Range<Data.Index> = data.startIndex.advanced(by: 1)..<data.endIndex.advanced(by: -1)
         let replacement = Data(bytes: [0xFF, 0xFF])
         data.replaceSubrange(range, with: replacement)
         expectEqual(data, Data(bytes: [4, 0xFF, 0xFF, 8]))
@@ -1554,10 +1725,10 @@ class TestData : TestDataSuper {
         }
     }
     
-    func test_validateMutation_cow_replaceSubrangeCountableRange() {
+    func test_validateMutation_cow_replaceSubrangeRange() {
         var data = Data(bytes: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
         holdReference(data) {
-            let range: CountableRange<Data.Index> = data.startIndex.advanced(by: 4)..<data.startIndex.advanced(by: 9)
+            let range: Range<Data.Index> = data.startIndex.advanced(by: 4)..<data.startIndex.advanced(by: 9)
             let replacement = Data(bytes: [0xFF, 0xFF])
             data.replaceSubrange(range, with: replacement)
             expectEqual(data, Data(bytes: [0, 1, 2, 3, 0xFF, 0xFF, 9]))
@@ -1671,10 +1842,10 @@ class TestData : TestDataSuper {
         }
     }
     
-    func test_validateMutation_slice_cow_replaceSubrangeCountableRange() {
+    func test_validateMutation_slice_cow_replaceSubrangeRange() {
         var data = Data(bytes: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9])[4..<9]
         holdReference(data) {
-            let range: CountableRange<Data.Index> = data.startIndex.advanced(by: 1)..<data.endIndex.advanced(by: -1)
+            let range: Range<Data.Index> = data.startIndex.advanced(by: 1)..<data.endIndex.advanced(by: -1)
             let replacement = Data(bytes: [0xFF, 0xFF])
             data.replaceSubrange(range, with: replacement)
             expectEqual(data, Data(bytes: [4, 0xFF, 0xFF, 8]))
@@ -1776,9 +1947,9 @@ class TestData : TestDataSuper {
         expectEqual(data, Data(bytes: [0x68, 0x65, 0x6c, 0x6c, 0xFF, 0xFF, 0x6c, 0x64]))
     }
     
-    func test_validateMutation_immutableBacking_replaceSubrangeCountableRange() {
+    func test_validateMutation_immutableBacking_replaceSubrangeRange() {
         var data = NSData(bytes: "hello world", length: 11) as Data
-        let range: CountableRange<Data.Index> = data.startIndex.advanced(by: 4)..<data.startIndex.advanced(by: 9)
+        let range: Range<Data.Index> = data.startIndex.advanced(by: 4)..<data.startIndex.advanced(by: 9)
         let replacement = Data(bytes: [0xFF, 0xFF])
         data.replaceSubrange(range, with: replacement)
         expectEqual(data, Data(bytes: [0x68, 0x65, 0x6c, 0x6c, 0xFF, 0xFF, 0x6c, 0x64]))
@@ -1884,12 +2055,12 @@ class TestData : TestDataSuper {
         expectEqual(data, Data(bytes: [4, 0xFF, 0xFF, 8]))
     }
     
-    func test_validateMutation_slice_immutableBacking_replaceSubrangeCountableRange() {
+    func test_validateMutation_slice_immutableBacking_replaceSubrangeRange() {
         let base: [UInt8] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
         var data = base.withUnsafeBufferPointer {
             return (NSData(bytes: $0.baseAddress!, length: $0.count) as Data)[4..<9]
         }
-        let range: CountableRange<Data.Index> = data.startIndex.advanced(by: 1)..<data.endIndex.advanced(by: -1)
+        let range: Range<Data.Index> = data.startIndex.advanced(by: 1)..<data.endIndex.advanced(by: -1)
         data.replaceSubrange(range, with: Data(bytes: [0xFF, 0xFF]))
         expectEqual(data, Data(bytes: [4, 0xFF, 0xFF, 8]))
     }
@@ -2008,10 +2179,10 @@ class TestData : TestDataSuper {
         }
     }
     
-    func test_validateMutation_cow_immutableBacking_replaceSubrangeCountableRange() {
+    func test_validateMutation_cow_immutableBacking_replaceSubrangeRange() {
         var data = NSData(bytes: "hello world", length: 11) as Data
         holdReference(data) {
-            let range: CountableRange<Data.Index> = data.startIndex.advanced(by: 4)..<data.startIndex.advanced(by: 9)
+            let range: Range<Data.Index> = data.startIndex.advanced(by: 4)..<data.startIndex.advanced(by: 9)
             let replacement = Data(bytes: [0xFF, 0xFF])
             data.replaceSubrange(range, with: replacement)
             expectEqual(data, Data(bytes: [0x68, 0x65, 0x6c, 0x6c, 0xff, 0xff, 0x6c, 0x64]))
@@ -2141,13 +2312,13 @@ class TestData : TestDataSuper {
         }
     }
     
-    func test_validateMutation_slice_cow_immutableBacking_replaceSubrangeCountableRange() {
+    func test_validateMutation_slice_cow_immutableBacking_replaceSubrangeRange() {
         let baseBytes: [UInt8] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
         var data = baseBytes.withUnsafeBufferPointer {
             return (NSData(bytes: $0.baseAddress!, length: $0.count) as Data)[4..<9]
         }
         holdReference(data) {
-            let range: CountableRange<Data.Index> = data.startIndex.advanced(by: 1)..<data.endIndex.advanced(by: -1)
+            let range: Range<Data.Index> = data.startIndex.advanced(by: 1)..<data.endIndex.advanced(by: -1)
             data.replaceSubrange(range, with: Data(bytes: [0xFF, 0xFF]))
             expectEqual(data, Data(bytes: [4, 0xFF, 0xFF, 8]))
         }
@@ -2278,13 +2449,13 @@ class TestData : TestDataSuper {
         expectEqual(data, Data(bytes: [0, 0xFF, 0xFF, 9]))
     }
     
-    func test_validateMutation_mutableBacking_replaceSubrangeCountableRange() {
+    func test_validateMutation_mutableBacking_replaceSubrangeRange() {
         let baseBytes: [UInt8] = [0, 1, 2, 3, 4, 5, 6]
         var data = baseBytes.withUnsafeBufferPointer {
             return NSData(bytes: $0.baseAddress!, length: $0.count) as Data
         }
         data.append(contentsOf: [7, 8, 9])
-        let range: CountableRange<Data.Index> = data.startIndex.advanced(by: 1)..<data.endIndex.advanced(by: -1)
+        let range: Range<Data.Index> = data.startIndex.advanced(by: 1)..<data.endIndex.advanced(by: -1)
         let replacement = Data(bytes: [0xFF, 0xFF])
         data.replaceSubrange(range, with: replacement)
         expectEqual(data, Data(bytes: [0, 0xFF, 0xFF, 9]))
@@ -2409,11 +2580,11 @@ class TestData : TestDataSuper {
         expectEqual(data, Data(bytes: [0x6f, 0xFF, 0xFF, 0x72]))
     }
     
-    func test_validateMutation_slice_mutableBacking_replaceSubrangeCountableRange() {
+    func test_validateMutation_slice_mutableBacking_replaceSubrangeRange() {
         var base = NSData(bytes: "hello world", length: 11) as Data
         base.append(contentsOf: [1, 2, 3, 4, 5, 6])
         var data = base[4..<9]
-        let range: CountableRange<Data.Index> = data.startIndex.advanced(by: 1)..<data.endIndex.advanced(by: -1)
+        let range: Range<Data.Index> = data.startIndex.advanced(by: 1)..<data.endIndex.advanced(by: -1)
         data.replaceSubrange(range, with: Data(bytes: [0xFF, 0xFF]))
         expectEqual(data, Data(bytes: [0x6f, 0xFF, 0xFF, 0x72]))
     }
@@ -2536,11 +2707,11 @@ class TestData : TestDataSuper {
         }
     }
     
-    func test_validateMutation_cow_mutableBacking_replaceSubrangeCountableRange() {
+    func test_validateMutation_cow_mutableBacking_replaceSubrangeRange() {
         var data = NSData(bytes: "hello world", length: 11) as Data
         data.append(contentsOf: [1, 2, 3, 4, 5, 6])
         holdReference(data) {
-            let range: CountableRange<Data.Index> = data.startIndex.advanced(by: 4)..<data.startIndex.advanced(by: 9)
+            let range: Range<Data.Index> = data.startIndex.advanced(by: 4)..<data.startIndex.advanced(by: 9)
             let replacement = Data(bytes: [0xFF, 0xFF])
             data.replaceSubrange(range, with: replacement)
             expectEqual(data, Data(bytes: [0x68, 0x65, 0x6c, 0x6c, 0xff, 0xff, 0x6c, 0x64, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06]))
@@ -2694,7 +2865,7 @@ class TestData : TestDataSuper {
         }
     }
     
-    func test_validateMutation_slice_cow_mutableBacking_replaceSubrangeCountableRange() {
+    func test_validateMutation_slice_cow_mutableBacking_replaceSubrangeRange() {
         let baseBytes: [UInt8] = [0, 1, 2, 3, 4, 5, 6]
         var base = baseBytes.withUnsafeBufferPointer {
             return NSData(bytes: $0.baseAddress!, length: $0.count) as Data
@@ -2702,7 +2873,7 @@ class TestData : TestDataSuper {
         base.append(contentsOf: [7, 8, 9])
         var data = base[4..<9]
         holdReference(data) {
-            let range: CountableRange<Data.Index> = data.startIndex.advanced(by: 1)..<data.endIndex.advanced(by: -1)
+            let range: Range<Data.Index> = data.startIndex.advanced(by: 1)..<data.endIndex.advanced(by: -1)
             data.replaceSubrange(range, with: Data(bytes: [0xFF, 0xFF]))
             expectEqual(data, Data(bytes: [4, 0xFF, 0xFF, 8]))
         }
@@ -2809,9 +2980,9 @@ class TestData : TestDataSuper {
         expectEqual(data, Data(bytes: [1, 0xFF, 0xFF, 1, 1, 1, 1, 1, 1]))
     }
     
-    func test_validateMutation_customBacking_replaceSubrangeCountableRange() {
+    func test_validateMutation_customBacking_replaceSubrangeRange() {
         var data = Data(referencing: AllOnesImmutableData(length: 10))
-        let range: CountableRange<Int> = 1..<4
+        let range: Range<Int> = 1..<4
         data.replaceSubrange(range, with: Data(bytes: [0xFF, 0xFF]))
         expectEqual(data, Data(bytes: [1, 0xFF, 0xFF, 1, 1, 1, 1, 1, 1]))
     }
@@ -2901,9 +3072,9 @@ class TestData : TestDataSuper {
         expectEqual(data, Data(bytes: [1, 0xFF, 0xFF, 1]))
     }
     
-    func test_validateMutation_slice_customBacking_replaceSubrangeCountableRange() {
+    func test_validateMutation_slice_customBacking_replaceSubrangeRange() {
         var data = Data(referencing: AllOnesImmutableData(length: 10))[4..<9]
-        let range: CountableRange<Int> = data.startIndex.advanced(by: 1)..<data.endIndex.advanced(by: -1)
+        let range: Range<Int> = data.startIndex.advanced(by: 1)..<data.endIndex.advanced(by: -1)
         data.replaceSubrange(range, with: Data(bytes: [0xFF, 0xFF]))
         expectEqual(data, Data(bytes: [1, 0xFF, 0xFF, 1]))
     }
@@ -3006,10 +3177,10 @@ class TestData : TestDataSuper {
         }
     }
     
-    func test_validateMutation_cow_customBacking_replaceSubrangeCountableRange() {
+    func test_validateMutation_cow_customBacking_replaceSubrangeRange() {
         var data = Data(referencing: AllOnesImmutableData(length: 10))
         holdReference(data) {
-            let range: CountableRange<Int> = data.startIndex.advanced(by: 1)..<data.endIndex.advanced(by: -1)
+            let range: Range<Int> = data.startIndex.advanced(by: 1)..<data.endIndex.advanced(by: -1)
             data.replaceSubrange(range, with: Data(bytes: [0xFF, 0xFF]))
             expectEqual(data, Data(bytes: [1, 0xFF, 0xFF, 1]))
         }
@@ -3117,10 +3288,10 @@ class TestData : TestDataSuper {
         }
     }
     
-    func test_validateMutation_slice_cow_customBacking_replaceSubrangeCountableRange() {
+    func test_validateMutation_slice_cow_customBacking_replaceSubrangeRange() {
         var data = Data(referencing: AllOnesImmutableData(length: 10))[4..<9]
         holdReference(data) {
-            let range: CountableRange<Int> = data.startIndex.advanced(by: 1)..<data.endIndex.advanced(by: -1)
+            let range: Range<Int> = data.startIndex.advanced(by: 1)..<data.endIndex.advanced(by: -1)
             data.replaceSubrange(range, with: Data(bytes: [0xFF, 0xFF]))
             expectEqual(data, Data(bytes: [1, 0xFF, 0xFF, 1]))
         }
@@ -3222,10 +3393,10 @@ class TestData : TestDataSuper {
         expectEqual(data, Data(bytes: [1, 0xFF, 0xFF, 0]))
     }
     
-    func test_validateMutation_customMutableBacking_replaceSubrangeCountableRange() {
+    func test_validateMutation_customMutableBacking_replaceSubrangeRange() {
         var data = Data(referencing: AllOnesData(length: 1))
         data.count = 10
-        let range: CountableRange<Int> = data.startIndex.advanced(by: 1)..<data.endIndex.advanced(by: -1)
+        let range: Range<Int> = data.startIndex.advanced(by: 1)..<data.endIndex.advanced(by: -1)
         data.replaceSubrange(range, with: Data(bytes: [0xFF, 0xFF]))
         expectEqual(data, Data(bytes: [1, 0xFF, 0xFF, 0]))
     }
@@ -3329,11 +3500,11 @@ class TestData : TestDataSuper {
         expectEqual(data, Data(bytes: [0, 0xFF, 0xFF, 0]))
     }
     
-    func test_validateMutation_slice_customMutableBacking_replaceSubrangeCountableRange() {
+    func test_validateMutation_slice_customMutableBacking_replaceSubrangeRange() {
         var base = Data(referencing: AllOnesData(length: 1))
         base.count = 10
         var data = base[4..<9]
-        let range: CountableRange<Int> = data.startIndex.advanced(by: 1)..<data.endIndex.advanced(by: -1)
+        let range: Range<Int> = data.startIndex.advanced(by: 1)..<data.endIndex.advanced(by: -1)
         data.replaceSubrange(range, with: Data(bytes: [0xFF, 0xFF]))
         expectEqual(data, Data(bytes: [0, 0xFF, 0xFF, 0]))
     }
@@ -3447,11 +3618,11 @@ class TestData : TestDataSuper {
         }
     }
     
-    func test_validateMutation_cow_customMutableBacking_replaceSubrangeCountableRange() {
+    func test_validateMutation_cow_customMutableBacking_replaceSubrangeRange() {
         var data = Data(referencing: AllOnesData(length: 1))
         data.count = 10
         holdReference(data) {
-            let range: CountableRange<Int> = data.startIndex.advanced(by: 1)..<data.endIndex.advanced(by: -1)
+            let range: Range<Int> = data.startIndex.advanced(by: 1)..<data.endIndex.advanced(by: -1)
             data.replaceSubrange(range, with: Data(bytes: [0xFF, 0xFF]))
             expectEqual(data, Data(bytes: [1, 0xFF, 0xFF, 0])) 
         }
@@ -3576,12 +3747,12 @@ class TestData : TestDataSuper {
         }
     }
     
-    func test_validateMutation_slice_cow_customMutableBacking_replaceSubrangeCountableRange() {
+    func test_validateMutation_slice_cow_customMutableBacking_replaceSubrangeRange() {
         var base = Data(referencing: AllOnesData(length: 1))
         base.count = 10
         var data = base[4..<9]
         holdReference(data) {
-            let range: CountableRange<Int> = data.startIndex.advanced(by: 1)..<data.endIndex.advanced(by: -1)
+            let range: Range<Int> = data.startIndex.advanced(by: 1)..<data.endIndex.advanced(by: -1)
             data.replaceSubrange(range, with: Data(bytes: [0xFF, 0xFF]))
             expectEqual(data, Data(bytes: [0, 0xFF, 0xFF, 0]))
         }
@@ -3642,28 +3813,6 @@ class TestData : TestDataSuper {
         expectEqual(data, Data(bytes: [4, 5, 6, 7, 0, 0]))
     }
 
-    func test_sliceEnumeration() {
-        var base = DispatchData.empty
-        let bytes: [UInt8] = [0, 1, 2, 3, 4]
-        base.append(bytes.withUnsafeBytes { DispatchData(bytes: $0) })
-        base.append(bytes.withUnsafeBytes { DispatchData(bytes: $0) })
-        base.append(bytes.withUnsafeBytes { DispatchData(bytes: $0) })
-        let data = ((base as AnyObject) as! Data)[3..<11]
-        var regionRanges: [Range<Int>] = []
-        var regionData: [Data] = []
-        data.enumerateBytes { (buffer, index, _) in
-            regionData.append(Data(bytes: buffer.baseAddress!, count: buffer.count))
-            regionRanges.append(index..<index + buffer.count)
-        }
-        expectEqual(regionRanges.count, 3)
-        expectEqual(Range<Data.Index>(3..<5), regionRanges[0])
-        expectEqual(Range<Data.Index>(5..<10), regionRanges[1])
-        expectEqual(Range<Data.Index>(10..<11), regionRanges[2])
-        expectEqual(Data(bytes: [3, 4]), regionData[0]) //fails
-        expectEqual(Data(bytes: [0, 1, 2, 3, 4]), regionData[1]) //passes
-        expectEqual(Data(bytes: [0]), regionData[2]) //fails
-    }
-
     func test_hashEmptyData() {
         let d1 = Data()
         let h1 = d1.hashValue
@@ -3677,12 +3826,257 @@ class TestData : TestDataSuper {
         let h3 = d3.hashValue
         expectEqual(h1, h3)
     }
+    
+    func test_validateMutation_slice_withUnsafeMutableBytes_lengthLessThanLowerBound() {
+        var data = Data(bytes: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9])[4..<6]
+        data.withUnsafeMutableBytes { (ptr: UnsafeMutablePointer<UInt8>) in
+            ptr.advanced(by: 1).pointee = 0xFF
+        }
+        expectEqual(data, Data(bytes: [4, 0xFF]))
+    }
+    
+    func test_validateMutation_slice_immutableBacking_withUnsafeMutableBytes_lengthLessThanLowerBound() {
+        var data = Data(referencing: NSData(bytes: "hello world", length: 11))[4..<6]
+        data.withUnsafeMutableBytes { (ptr: UnsafeMutablePointer<UInt8>) in
+            ptr.advanced(by: 1).pointee = 0xFF
+        }
+        expectEqual(data[data.startIndex.advanced(by: 1)], 0xFF)
+    }
+    
+    func test_validateMutation_slice_mutableBacking_withUnsafeMutableBytes_lengthLessThanLowerBound() {
+        var base = Data(referencing: NSData(bytes: "hello world", length: 11))
+        base.append(contentsOf: [1, 2, 3, 4, 5, 6])
+        var data = base[4..<6]
+        data.withUnsafeMutableBytes { (ptr: UnsafeMutablePointer<UInt8>) in
+            ptr.advanced(by: 1).pointee = 0xFF
+        }
+        expectEqual(data[data.startIndex.advanced(by: 1)], 0xFF)
+    }
+    
+    func test_validateMutation_slice_customBacking_withUnsafeMutableBytes_lengthLessThanLowerBound() {
+        var data = Data(referencing: AllOnesImmutableData(length: 10))[4..<6]
+        data.withUnsafeMutableBytes { (ptr: UnsafeMutablePointer<UInt8>) in
+            ptr.advanced(by: 1).pointee = 0xFF
+        }
+        expectEqual(data[data.startIndex.advanced(by: 1)], 0xFF)
+    }
+    
+    func test_validateMutation_slice_customMutableBacking_withUnsafeMutableBytes_lengthLessThanLowerBound() {
+        var base = Data(referencing: AllOnesData(length: 1))
+        base.count = 10
+        var data = base[4..<6]
+        data.withUnsafeMutableBytes { (ptr: UnsafeMutablePointer<UInt8>) in
+            ptr.advanced(by: 1).pointee = 0xFF
+        }
+        expectEqual(data[data.startIndex.advanced(by: 1)], 0xFF)
+    }
+
+    func test_byte_access_of_discontiguousData() {
+        var d = DispatchData.empty
+        let bytes: [UInt8] = [0, 1, 2, 3, 4, 5]
+        for _ in 0..<3 {
+            bytes.withUnsafeBufferPointer {
+                d.append($0)
+            }
+        }
+        let ref = d as AnyObject
+        let data = ref as! Data
+
+        let cnt = data.count - 4
+        let t = data.dropFirst(4).withUnsafeBytes { (bytes: UnsafePointer<UInt8>) in
+            return Data(bytes: bytes, count: cnt)
+        }
+
+        expectEqual(Data(bytes: [4, 5, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5]), t)
+    }
+
+    func test_rangeOfSlice() {
+        let data = "FooBar".data(using: .ascii)!
+        let slice = data[3...] // Bar
+
+        let range = slice.range(of: "a".data(using: .ascii)!)
+        expectEqual(range, Range<Data.Index>(4..<5))
+    }
+
+    func test_nsdataSequence() {
+        if #available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *) {
+            let bytes: [UInt8] = Array(0x00...0xFF)
+            let data = bytes.withUnsafeBytes { NSData(bytes: $0.baseAddress, length: $0.count) }
+
+            for byte in bytes {
+                expectEqual(data[Int(byte)], byte)
+            }
+        }
+    }
+
+    func test_dispatchSequence() {
+        if #available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *) {
+            let bytes1: [UInt8] = Array(0x00..<0xF0)
+            let bytes2: [UInt8] = Array(0xF0..<0xFF)
+            var data = DispatchData.empty
+            bytes1.withUnsafeBytes {
+                data.append($0)
+            }
+            bytes2.withUnsafeBytes {
+                data.append($0)
+            }
+
+            for byte in bytes1 {
+                expectEqual(data[Int(byte)], byte)
+            }
+            for byte in bytes2 {
+                expectEqual(data[Int(byte)], byte)
+            }
+        }
+    }
+
+    func test_increaseCount() {
+        guard #available(macOS 10.16, iOS 14.0, watchOS 7.0, tvOS 14.0, *) else { return }
+        let initials: [Range<UInt8>] = [
+            0..<0,
+            0..<2,
+            0..<4,
+            0..<8,
+            0..<16,
+            0..<32,
+            0..<64
+        ]
+        let diffs = [0, 1, 2, 4, 8, 16, 32]
+        for initial in initials {
+            for diff in diffs {
+                var data = Data(initial)
+                data.count += diff
+                expectEqualSequence(
+                    Array(initial) + Array(repeating: 0, count: diff),
+                    data)
+            }
+        }
+    }
+
+    func test_decreaseCount() {
+        guard #available(macOS 10.16, iOS 14.0, watchOS 7.0, tvOS 14.0, *) else { return }
+        let initials: [Range<UInt8>] = [
+            0..<0,
+            0..<2,
+            0..<4,
+            0..<8,
+            0..<16,
+            0..<32,
+            0..<64
+        ]
+        let diffs = [0, 1, 2, 4, 8, 16, 32]
+        for initial in initials {
+            for diff in diffs {
+                guard initial.count >= diff else { continue }
+                var data = Data(initial)
+                data.count -= diff
+                expectEqualSequence(
+                    initial.dropLast(diff),
+                    data)
+            }
+        }
+    }
+
+    // This is a (potentially invalid) sequence that produces a configurable number of 42s and has a freely customizable `underestimatedCount`.
+    struct TestSequence: Sequence {
+        typealias Element = UInt8
+        struct Iterator: IteratorProtocol {
+            var _remaining: Int
+            init(_ count: Int) {
+                _remaining = count
+            }
+            mutating func next() -> UInt8? {
+                guard _remaining > 0 else { return nil }
+                _remaining -= 1
+                return 42
+            }
+        }
+        let underestimatedCount: Int
+        let count: Int
+
+        func makeIterator() -> Iterator {
+            return Iterator(count)
+        }
+    }
+
+    func test_init_TestSequence() {
+        // Underestimated count
+        do {
+            let d = Data(TestSequence(underestimatedCount: 0, count: 10))
+            expectEqual(10, d.count)
+            expectEqual(Array(repeating: 42 as UInt8, count: 10), Array(d))
+        }
+
+        // Very underestimated count (to exercise realloc path)
+        do {
+            let d = Data(TestSequence(underestimatedCount: 0, count: 1000))
+            expectEqual(1000, d.count)
+            expectEqual(Array(repeating: 42 as UInt8, count: 1000), Array(d))
+        }
+
+        // Exact count
+        do {
+            let d = Data(TestSequence(underestimatedCount: 10, count: 10))
+            expectEqual(10, d.count)
+            expectEqual(Array(repeating: 42 as UInt8, count: 10), Array(d))
+        }
+
+        // Overestimated count. This is an illegal case, so trapping would be fine.
+        // However, for compatibility with the implementation in Swift 5, Data
+        // handles this case by simply truncating itself to the actual size.
+        do {
+            let d = Data(TestSequence(underestimatedCount: 20, count: 10))
+            expectEqual(10, d.count)
+            expectEqual(Array(repeating: 42 as UInt8, count: 10), Array(d))
+        }
+    }
+
+    func test_append_TestSequence() {
+        let base = Data(Array(repeating: 23 as UInt8, count: 10))
+
+        // Underestimated count
+        do {
+            var d = base
+            d.append(contentsOf: TestSequence(underestimatedCount: 0, count: 10))
+            expectEqual(20, d.count)
+            expectEqual(Array(base) + Array(repeating: 42 as UInt8, count: 10),
+                           Array(d))
+        }
+
+        // Very underestimated count (to exercise realloc path)
+        do {
+            var d = base
+            d.append(contentsOf: TestSequence(underestimatedCount: 0, count: 1000))
+            expectEqual(1010, d.count)
+            expectEqual(Array(base) + Array(repeating: 42 as UInt8, count: 1000), Array(d))
+        }
+
+        // Exact count
+        do {
+            var d = base
+            d.append(contentsOf: TestSequence(underestimatedCount: 10, count: 10))
+            expectEqual(20, d.count)
+            expectEqual(Array(base) + Array(repeating: 42 as UInt8, count: 10), Array(d))
+        }
+
+        // Overestimated count. This is an illegal case, so trapping would be fine.
+        // However, for compatibility with the implementation in Swift 5, Data
+        // handles this case by simply truncating itself to the actual size.
+        do {
+            var d = base
+            d.append(contentsOf: TestSequence(underestimatedCount: 20, count: 10))
+            expectEqual(20, d.count)
+            expectEqual(Array(base) + Array(repeating: 42 as UInt8, count: 10), Array(d))
+        }
+    }
 }
 
 #if !FOUNDATION_XCTEST
 var DataTests = TestSuite("TestData")
 DataTests.test("testBasicConstruction") { TestData().testBasicConstruction() }
 DataTests.test("testInitializationWithArray") { TestData().testInitializationWithArray() }
+DataTests.test("testInitializationWithBufferPointer") { TestData().testInitializationWithBufferPointer() }
+DataTests.test("testInitializationWithMutableBufferPointer") { TestData().testInitializationWithMutableBufferPointer() }
 DataTests.test("testMutableData") { TestData().testMutableData() }
 DataTests.test("testCustomData") { TestData().testCustomData() }
 DataTests.test("testBridgingDefault") { TestData().testBridgingDefault() }
@@ -3706,14 +4100,12 @@ DataTests.test("testCopyBytes_oversized") { TestData().testCopyBytes_oversized()
 DataTests.test("testCopyBytes_ranges") { TestData().testCopyBytes_ranges() }
 DataTests.test("test_base64Data_small") { TestData().test_base64Data_small() }
 DataTests.test("test_base64Data_medium") { TestData().test_base64Data_medium() }
-DataTests.test("test_dataHash") { TestData().test_dataHash() }
 DataTests.test("test_discontiguousEnumerateBytes") { TestData().test_discontiguousEnumerateBytes() }
 DataTests.test("test_basicReadWrite") { TestData().test_basicReadWrite() }
 DataTests.test("test_writeFailure") { TestData().test_writeFailure() }
 DataTests.test("test_genericBuffers") { TestData().test_genericBuffers() }
 DataTests.test("test_basicDataMutation") { TestData().test_basicDataMutation() }
 DataTests.test("test_basicMutableDataMutation") { TestData().test_basicMutableDataMutation() }
-DataTests.test("test_roundTrip") { TestData().test_roundTrip() }
 DataTests.test("test_passing") { TestData().test_passing() }
 DataTests.test("test_bufferSizeCalculation") { TestData().test_bufferSizeCalculation() }
 DataTests.test("test_classForCoder") { TestData().test_classForCoder() }
@@ -3723,6 +4115,7 @@ DataTests.test("test_noCopyBehavior") { TestData().test_noCopyBehavior() }
 DataTests.test("test_doubleDeallocation") { TestData().test_doubleDeallocation() }
 DataTests.test("test_repeatingValueInitialization") { TestData().test_repeatingValueInitialization() }
 DataTests.test("test_rangeZoo") { TestData().test_rangeZoo() }
+DataTests.test("test_rangeOfDataProtocol") { TestData().test_rangeOfDataProtocol() }
 DataTests.test("test_sliceAppending") { TestData().test_sliceAppending() }
 DataTests.test("test_replaceSubrange") { TestData().test_replaceSubrange() }
 DataTests.test("test_sliceWithUnsafeBytes") { TestData().test_sliceWithUnsafeBytes() }
@@ -3739,6 +4132,8 @@ DataTests.test("test_copyBytes1") { TestData().test_copyBytes1() }
 DataTests.test("test_copyBytes2") { TestData().test_copyBytes2() }
 DataTests.test("test_sliceOfSliceViaRangeExpression") { TestData().test_sliceOfSliceViaRangeExpression() }
 DataTests.test("test_appendingSlices") { TestData().test_appendingSlices() }
+DataTests.test("test_appendingNonContiguousSequence_exactCount") { TestData().test_appendingNonContiguousSequence_exactCount() }
+DataTests.test("test_appendingNonContiguousSequence_underestimatedCount") { TestData().test_appendingNonContiguousSequence_underestimatedCount() }
 DataTests.test("test_sequenceInitializers") { TestData().test_sequenceInitializers() }
 DataTests.test("test_reversedDataInit") { TestData().test_reversedDataInit() }
 DataTests.test("test_replaceSubrangeReferencingMutable") { TestData().test_replaceSubrangeReferencingMutable() }
@@ -3752,7 +4147,7 @@ DataTests.test("test_validateMutation_appendSequence") { TestData().test_validat
 DataTests.test("test_validateMutation_appendContentsOf") { TestData().test_validateMutation_appendContentsOf() }
 DataTests.test("test_validateMutation_resetBytes") { TestData().test_validateMutation_resetBytes() }
 DataTests.test("test_validateMutation_replaceSubrange") { TestData().test_validateMutation_replaceSubrange() }
-DataTests.test("test_validateMutation_replaceSubrangeCountableRange") { TestData().test_validateMutation_replaceSubrangeCountableRange() }
+DataTests.test("test_validateMutation_replaceSubrangeRange") { TestData().test_validateMutation_replaceSubrangeRange() }
 DataTests.test("test_validateMutation_replaceSubrangeWithBuffer") { TestData().test_validateMutation_replaceSubrangeWithBuffer() }
 DataTests.test("test_validateMutation_replaceSubrangeWithCollection") { TestData().test_validateMutation_replaceSubrangeWithCollection() }
 DataTests.test("test_validateMutation_replaceSubrangeWithBytes") { TestData().test_validateMutation_replaceSubrangeWithBytes() }
@@ -3764,7 +4159,7 @@ DataTests.test("test_validateMutation_slice_appendSequence") { TestData().test_v
 DataTests.test("test_validateMutation_slice_appendContentsOf") { TestData().test_validateMutation_slice_appendContentsOf() }
 DataTests.test("test_validateMutation_slice_resetBytes") { TestData().test_validateMutation_slice_resetBytes() }
 DataTests.test("test_validateMutation_slice_replaceSubrange") { TestData().test_validateMutation_slice_replaceSubrange() }
-DataTests.test("test_validateMutation_slice_replaceSubrangeCountableRange") { TestData().test_validateMutation_slice_replaceSubrangeCountableRange() }
+DataTests.test("test_validateMutation_slice_replaceSubrangeRange") { TestData().test_validateMutation_slice_replaceSubrangeRange() }
 DataTests.test("test_validateMutation_slice_replaceSubrangeWithBuffer") { TestData().test_validateMutation_slice_replaceSubrangeWithBuffer() }
 DataTests.test("test_validateMutation_slice_replaceSubrangeWithCollection") { TestData().test_validateMutation_slice_replaceSubrangeWithCollection() }
 DataTests.test("test_validateMutation_slice_replaceSubrangeWithBytes") { TestData().test_validateMutation_slice_replaceSubrangeWithBytes() }
@@ -3776,7 +4171,7 @@ DataTests.test("test_validateMutation_cow_appendSequence") { TestData().test_val
 DataTests.test("test_validateMutation_cow_appendContentsOf") { TestData().test_validateMutation_cow_appendContentsOf() }
 DataTests.test("test_validateMutation_cow_resetBytes") { TestData().test_validateMutation_cow_resetBytes() }
 DataTests.test("test_validateMutation_cow_replaceSubrange") { TestData().test_validateMutation_cow_replaceSubrange() }
-DataTests.test("test_validateMutation_cow_replaceSubrangeCountableRange") { TestData().test_validateMutation_cow_replaceSubrangeCountableRange() }
+DataTests.test("test_validateMutation_cow_replaceSubrangeRange") { TestData().test_validateMutation_cow_replaceSubrangeRange() }
 DataTests.test("test_validateMutation_cow_replaceSubrangeWithBuffer") { TestData().test_validateMutation_cow_replaceSubrangeWithBuffer() }
 DataTests.test("test_validateMutation_cow_replaceSubrangeWithCollection") { TestData().test_validateMutation_cow_replaceSubrangeWithCollection() }
 DataTests.test("test_validateMutation_cow_replaceSubrangeWithBytes") { TestData().test_validateMutation_cow_replaceSubrangeWithBytes() }
@@ -3788,7 +4183,7 @@ DataTests.test("test_validateMutation_slice_cow_appendSequence") { TestData().te
 DataTests.test("test_validateMutation_slice_cow_appendContentsOf") { TestData().test_validateMutation_slice_cow_appendContentsOf() }
 DataTests.test("test_validateMutation_slice_cow_resetBytes") { TestData().test_validateMutation_slice_cow_resetBytes() }
 DataTests.test("test_validateMutation_slice_cow_replaceSubrange") { TestData().test_validateMutation_slice_cow_replaceSubrange() }
-DataTests.test("test_validateMutation_slice_cow_replaceSubrangeCountableRange") { TestData().test_validateMutation_slice_cow_replaceSubrangeCountableRange() }
+DataTests.test("test_validateMutation_slice_cow_replaceSubrangeRange") { TestData().test_validateMutation_slice_cow_replaceSubrangeRange() }
 DataTests.test("test_validateMutation_slice_cow_replaceSubrangeWithBuffer") { TestData().test_validateMutation_slice_cow_replaceSubrangeWithBuffer() }
 DataTests.test("test_validateMutation_slice_cow_replaceSubrangeWithCollection") { TestData().test_validateMutation_slice_cow_replaceSubrangeWithCollection() }
 DataTests.test("test_validateMutation_slice_cow_replaceSubrangeWithBytes") { TestData().test_validateMutation_slice_cow_replaceSubrangeWithBytes() }
@@ -3800,7 +4195,7 @@ DataTests.test("test_validateMutation_immutableBacking_appendSequence") { TestDa
 DataTests.test("test_validateMutation_immutableBacking_appendContentsOf") { TestData().test_validateMutation_immutableBacking_appendContentsOf() }
 DataTests.test("test_validateMutation_immutableBacking_resetBytes") { TestData().test_validateMutation_immutableBacking_resetBytes() }
 DataTests.test("test_validateMutation_immutableBacking_replaceSubrange") { TestData().test_validateMutation_immutableBacking_replaceSubrange() }
-DataTests.test("test_validateMutation_immutableBacking_replaceSubrangeCountableRange") { TestData().test_validateMutation_immutableBacking_replaceSubrangeCountableRange() }
+DataTests.test("test_validateMutation_immutableBacking_replaceSubrangeRange") { TestData().test_validateMutation_immutableBacking_replaceSubrangeRange() }
 DataTests.test("test_validateMutation_immutableBacking_replaceSubrangeWithBuffer") { TestData().test_validateMutation_immutableBacking_replaceSubrangeWithBuffer() }
 DataTests.test("test_validateMutation_immutableBacking_replaceSubrangeWithCollection") { TestData().test_validateMutation_immutableBacking_replaceSubrangeWithCollection() }
 DataTests.test("test_validateMutation_immutableBacking_replaceSubrangeWithBytes") { TestData().test_validateMutation_immutableBacking_replaceSubrangeWithBytes() }
@@ -3812,7 +4207,7 @@ DataTests.test("test_validateMutation_slice_immutableBacking_appendSequence") { 
 DataTests.test("test_validateMutation_slice_immutableBacking_appendContentsOf") { TestData().test_validateMutation_slice_immutableBacking_appendContentsOf() }
 DataTests.test("test_validateMutation_slice_immutableBacking_resetBytes") { TestData().test_validateMutation_slice_immutableBacking_resetBytes() }
 DataTests.test("test_validateMutation_slice_immutableBacking_replaceSubrange") { TestData().test_validateMutation_slice_immutableBacking_replaceSubrange() }
-DataTests.test("test_validateMutation_slice_immutableBacking_replaceSubrangeCountableRange") { TestData().test_validateMutation_slice_immutableBacking_replaceSubrangeCountableRange() }
+DataTests.test("test_validateMutation_slice_immutableBacking_replaceSubrangeRange") { TestData().test_validateMutation_slice_immutableBacking_replaceSubrangeRange() }
 DataTests.test("test_validateMutation_slice_immutableBacking_replaceSubrangeWithBuffer") { TestData().test_validateMutation_slice_immutableBacking_replaceSubrangeWithBuffer() }
 DataTests.test("test_validateMutation_slice_immutableBacking_replaceSubrangeWithCollection") { TestData().test_validateMutation_slice_immutableBacking_replaceSubrangeWithCollection() }
 DataTests.test("test_validateMutation_slice_immutableBacking_replaceSubrangeWithBytes") { TestData().test_validateMutation_slice_immutableBacking_replaceSubrangeWithBytes() }
@@ -3824,7 +4219,7 @@ DataTests.test("test_validateMutation_cow_immutableBacking_appendSequence") { Te
 DataTests.test("test_validateMutation_cow_immutableBacking_appendContentsOf") { TestData().test_validateMutation_cow_immutableBacking_appendContentsOf() }
 DataTests.test("test_validateMutation_cow_immutableBacking_resetBytes") { TestData().test_validateMutation_cow_immutableBacking_resetBytes() }
 DataTests.test("test_validateMutation_cow_immutableBacking_replaceSubrange") { TestData().test_validateMutation_cow_immutableBacking_replaceSubrange() }
-DataTests.test("test_validateMutation_cow_immutableBacking_replaceSubrangeCountableRange") { TestData().test_validateMutation_cow_immutableBacking_replaceSubrangeCountableRange() }
+DataTests.test("test_validateMutation_cow_immutableBacking_replaceSubrangeRange") { TestData().test_validateMutation_cow_immutableBacking_replaceSubrangeRange() }
 DataTests.test("test_validateMutation_cow_immutableBacking_replaceSubrangeWithBuffer") { TestData().test_validateMutation_cow_immutableBacking_replaceSubrangeWithBuffer() }
 DataTests.test("test_validateMutation_cow_immutableBacking_replaceSubrangeWithCollection") { TestData().test_validateMutation_cow_immutableBacking_replaceSubrangeWithCollection() }
 DataTests.test("test_validateMutation_cow_immutableBacking_replaceSubrangeWithBytes") { TestData().test_validateMutation_cow_immutableBacking_replaceSubrangeWithBytes() }
@@ -3836,7 +4231,7 @@ DataTests.test("test_validateMutation_slice_cow_immutableBacking_appendSequence"
 DataTests.test("test_validateMutation_slice_cow_immutableBacking_appendContentsOf") { TestData().test_validateMutation_slice_cow_immutableBacking_appendContentsOf() }
 DataTests.test("test_validateMutation_slice_cow_immutableBacking_resetBytes") { TestData().test_validateMutation_slice_cow_immutableBacking_resetBytes() }
 DataTests.test("test_validateMutation_slice_cow_immutableBacking_replaceSubrange") { TestData().test_validateMutation_slice_cow_immutableBacking_replaceSubrange() }
-DataTests.test("test_validateMutation_slice_cow_immutableBacking_replaceSubrangeCountableRange") { TestData().test_validateMutation_slice_cow_immutableBacking_replaceSubrangeCountableRange() }
+DataTests.test("test_validateMutation_slice_cow_immutableBacking_replaceSubrangeRange") { TestData().test_validateMutation_slice_cow_immutableBacking_replaceSubrangeRange() }
 DataTests.test("test_validateMutation_slice_cow_immutableBacking_replaceSubrangeWithBuffer") { TestData().test_validateMutation_slice_cow_immutableBacking_replaceSubrangeWithBuffer() }
 DataTests.test("test_validateMutation_slice_cow_immutableBacking_replaceSubrangeWithCollection") { TestData().test_validateMutation_slice_cow_immutableBacking_replaceSubrangeWithCollection() }
 DataTests.test("test_validateMutation_slice_cow_immutableBacking_replaceSubrangeWithBytes") { TestData().test_validateMutation_slice_cow_immutableBacking_replaceSubrangeWithBytes() }
@@ -3848,7 +4243,7 @@ DataTests.test("test_validateMutation_mutableBacking_appendSequence") { TestData
 DataTests.test("test_validateMutation_mutableBacking_appendContentsOf") { TestData().test_validateMutation_mutableBacking_appendContentsOf() }
 DataTests.test("test_validateMutation_mutableBacking_resetBytes") { TestData().test_validateMutation_mutableBacking_resetBytes() }
 DataTests.test("test_validateMutation_mutableBacking_replaceSubrange") { TestData().test_validateMutation_mutableBacking_replaceSubrange() }
-DataTests.test("test_validateMutation_mutableBacking_replaceSubrangeCountableRange") { TestData().test_validateMutation_mutableBacking_replaceSubrangeCountableRange() }
+DataTests.test("test_validateMutation_mutableBacking_replaceSubrangeRange") { TestData().test_validateMutation_mutableBacking_replaceSubrangeRange() }
 DataTests.test("test_validateMutation_mutableBacking_replaceSubrangeWithBuffer") { TestData().test_validateMutation_mutableBacking_replaceSubrangeWithBuffer() }
 DataTests.test("test_validateMutation_mutableBacking_replaceSubrangeWithCollection") { TestData().test_validateMutation_mutableBacking_replaceSubrangeWithCollection() }
 DataTests.test("test_validateMutation_mutableBacking_replaceSubrangeWithBytes") { TestData().test_validateMutation_mutableBacking_replaceSubrangeWithBytes() }
@@ -3860,7 +4255,7 @@ DataTests.test("test_validateMutation_slice_mutableBacking_appendSequence") { Te
 DataTests.test("test_validateMutation_slice_mutableBacking_appendContentsOf") { TestData().test_validateMutation_slice_mutableBacking_appendContentsOf() }
 DataTests.test("test_validateMutation_slice_mutableBacking_resetBytes") { TestData().test_validateMutation_slice_mutableBacking_resetBytes() }
 DataTests.test("test_validateMutation_slice_mutableBacking_replaceSubrange") { TestData().test_validateMutation_slice_mutableBacking_replaceSubrange() }
-DataTests.test("test_validateMutation_slice_mutableBacking_replaceSubrangeCountableRange") { TestData().test_validateMutation_slice_mutableBacking_replaceSubrangeCountableRange() }
+DataTests.test("test_validateMutation_slice_mutableBacking_replaceSubrangeRange") { TestData().test_validateMutation_slice_mutableBacking_replaceSubrangeRange() }
 DataTests.test("test_validateMutation_slice_mutableBacking_replaceSubrangeWithBuffer") { TestData().test_validateMutation_slice_mutableBacking_replaceSubrangeWithBuffer() }
 DataTests.test("test_validateMutation_slice_mutableBacking_replaceSubrangeWithCollection") { TestData().test_validateMutation_slice_mutableBacking_replaceSubrangeWithCollection() }
 DataTests.test("test_validateMutation_slice_mutableBacking_replaceSubrangeWithBytes") { TestData().test_validateMutation_slice_mutableBacking_replaceSubrangeWithBytes() }
@@ -3872,7 +4267,7 @@ DataTests.test("test_validateMutation_cow_mutableBacking_appendSequence") { Test
 DataTests.test("test_validateMutation_cow_mutableBacking_appendContentsOf") { TestData().test_validateMutation_cow_mutableBacking_appendContentsOf() }
 DataTests.test("test_validateMutation_cow_mutableBacking_resetBytes") { TestData().test_validateMutation_cow_mutableBacking_resetBytes() }
 DataTests.test("test_validateMutation_cow_mutableBacking_replaceSubrange") { TestData().test_validateMutation_cow_mutableBacking_replaceSubrange() }
-DataTests.test("test_validateMutation_cow_mutableBacking_replaceSubrangeCountableRange") { TestData().test_validateMutation_cow_mutableBacking_replaceSubrangeCountableRange() }
+DataTests.test("test_validateMutation_cow_mutableBacking_replaceSubrangeRange") { TestData().test_validateMutation_cow_mutableBacking_replaceSubrangeRange() }
 DataTests.test("test_validateMutation_cow_mutableBacking_replaceSubrangeWithBuffer") { TestData().test_validateMutation_cow_mutableBacking_replaceSubrangeWithBuffer() }
 DataTests.test("test_validateMutation_cow_mutableBacking_replaceSubrangeWithCollection") { TestData().test_validateMutation_cow_mutableBacking_replaceSubrangeWithCollection() }
 DataTests.test("test_validateMutation_cow_mutableBacking_replaceSubrangeWithBytes") { TestData().test_validateMutation_cow_mutableBacking_replaceSubrangeWithBytes() }
@@ -3884,7 +4279,7 @@ DataTests.test("test_validateMutation_slice_cow_mutableBacking_appendSequence") 
 DataTests.test("test_validateMutation_slice_cow_mutableBacking_appendContentsOf") { TestData().test_validateMutation_slice_cow_mutableBacking_appendContentsOf() }
 DataTests.test("test_validateMutation_slice_cow_mutableBacking_resetBytes") { TestData().test_validateMutation_slice_cow_mutableBacking_resetBytes() }
 DataTests.test("test_validateMutation_slice_cow_mutableBacking_replaceSubrange") { TestData().test_validateMutation_slice_cow_mutableBacking_replaceSubrange() }
-DataTests.test("test_validateMutation_slice_cow_mutableBacking_replaceSubrangeCountableRange") { TestData().test_validateMutation_slice_cow_mutableBacking_replaceSubrangeCountableRange() }
+DataTests.test("test_validateMutation_slice_cow_mutableBacking_replaceSubrangeRange") { TestData().test_validateMutation_slice_cow_mutableBacking_replaceSubrangeRange() }
 DataTests.test("test_validateMutation_slice_cow_mutableBacking_replaceSubrangeWithBuffer") { TestData().test_validateMutation_slice_cow_mutableBacking_replaceSubrangeWithBuffer() }
 DataTests.test("test_validateMutation_slice_cow_mutableBacking_replaceSubrangeWithCollection") { TestData().test_validateMutation_slice_cow_mutableBacking_replaceSubrangeWithCollection() }
 DataTests.test("test_validateMutation_slice_cow_mutableBacking_replaceSubrangeWithBytes") { TestData().test_validateMutation_slice_cow_mutableBacking_replaceSubrangeWithBytes() }
@@ -3896,7 +4291,7 @@ DataTests.test("test_validateMutation_customBacking_appendSequence") { TestData(
 DataTests.test("test_validateMutation_customBacking_appendContentsOf") { TestData().test_validateMutation_customBacking_appendContentsOf() }
 DataTests.test("test_validateMutation_customBacking_resetBytes") { TestData().test_validateMutation_customBacking_resetBytes() }
 DataTests.test("test_validateMutation_customBacking_replaceSubrange") { TestData().test_validateMutation_customBacking_replaceSubrange() }
-DataTests.test("test_validateMutation_customBacking_replaceSubrangeCountableRange") { TestData().test_validateMutation_customBacking_replaceSubrangeCountableRange() }
+DataTests.test("test_validateMutation_customBacking_replaceSubrangeRange") { TestData().test_validateMutation_customBacking_replaceSubrangeRange() }
 DataTests.test("test_validateMutation_customBacking_replaceSubrangeWithBuffer") { TestData().test_validateMutation_customBacking_replaceSubrangeWithBuffer() }
 DataTests.test("test_validateMutation_customBacking_replaceSubrangeWithCollection") { TestData().test_validateMutation_customBacking_replaceSubrangeWithCollection() }
 DataTests.test("test_validateMutation_customBacking_replaceSubrangeWithBytes") { TestData().test_validateMutation_customBacking_replaceSubrangeWithBytes() }
@@ -3908,7 +4303,7 @@ DataTests.test("test_validateMutation_slice_customBacking_appendSequence") { Tes
 DataTests.test("test_validateMutation_slice_customBacking_appendContentsOf") { TestData().test_validateMutation_slice_customBacking_appendContentsOf() }
 DataTests.test("test_validateMutation_slice_customBacking_resetBytes") { TestData().test_validateMutation_slice_customBacking_resetBytes() }
 DataTests.test("test_validateMutation_slice_customBacking_replaceSubrange") { TestData().test_validateMutation_slice_customBacking_replaceSubrange() }
-DataTests.test("test_validateMutation_slice_customBacking_replaceSubrangeCountableRange") { TestData().test_validateMutation_slice_customBacking_replaceSubrangeCountableRange() }
+DataTests.test("test_validateMutation_slice_customBacking_replaceSubrangeRange") { TestData().test_validateMutation_slice_customBacking_replaceSubrangeRange() }
 DataTests.test("test_validateMutation_slice_customBacking_replaceSubrangeWithBuffer") { TestData().test_validateMutation_slice_customBacking_replaceSubrangeWithBuffer() }
 DataTests.test("test_validateMutation_slice_customBacking_replaceSubrangeWithCollection") { TestData().test_validateMutation_slice_customBacking_replaceSubrangeWithCollection() }
 DataTests.test("test_validateMutation_slice_customBacking_replaceSubrangeWithBytes") { TestData().test_validateMutation_slice_customBacking_replaceSubrangeWithBytes() }
@@ -3920,7 +4315,7 @@ DataTests.test("test_validateMutation_cow_customBacking_appendSequence") { TestD
 DataTests.test("test_validateMutation_cow_customBacking_appendContentsOf") { TestData().test_validateMutation_cow_customBacking_appendContentsOf() }
 DataTests.test("test_validateMutation_cow_customBacking_resetBytes") { TestData().test_validateMutation_cow_customBacking_resetBytes() }
 DataTests.test("test_validateMutation_cow_customBacking_replaceSubrange") { TestData().test_validateMutation_cow_customBacking_replaceSubrange() }
-DataTests.test("test_validateMutation_cow_customBacking_replaceSubrangeCountableRange") { TestData().test_validateMutation_cow_customBacking_replaceSubrangeCountableRange() }
+DataTests.test("test_validateMutation_cow_customBacking_replaceSubrangeRange") { TestData().test_validateMutation_cow_customBacking_replaceSubrangeRange() }
 DataTests.test("test_validateMutation_cow_customBacking_replaceSubrangeWithBuffer") { TestData().test_validateMutation_cow_customBacking_replaceSubrangeWithBuffer() }
 DataTests.test("test_validateMutation_cow_customBacking_replaceSubrangeWithCollection") { TestData().test_validateMutation_cow_customBacking_replaceSubrangeWithCollection() }
 DataTests.test("test_validateMutation_cow_customBacking_replaceSubrangeWithBytes") { TestData().test_validateMutation_cow_customBacking_replaceSubrangeWithBytes() }
@@ -3932,7 +4327,7 @@ DataTests.test("test_validateMutation_slice_cow_customBacking_appendSequence") {
 DataTests.test("test_validateMutation_slice_cow_customBacking_appendContentsOf") { TestData().test_validateMutation_slice_cow_customBacking_appendContentsOf() }
 DataTests.test("test_validateMutation_slice_cow_customBacking_resetBytes") { TestData().test_validateMutation_slice_cow_customBacking_resetBytes() }
 DataTests.test("test_validateMutation_slice_cow_customBacking_replaceSubrange") { TestData().test_validateMutation_slice_cow_customBacking_replaceSubrange() }
-DataTests.test("test_validateMutation_slice_cow_customBacking_replaceSubrangeCountableRange") { TestData().test_validateMutation_slice_cow_customBacking_replaceSubrangeCountableRange() }
+DataTests.test("test_validateMutation_slice_cow_customBacking_replaceSubrangeRange") { TestData().test_validateMutation_slice_cow_customBacking_replaceSubrangeRange() }
 DataTests.test("test_validateMutation_slice_cow_customBacking_replaceSubrangeWithBuffer") { TestData().test_validateMutation_slice_cow_customBacking_replaceSubrangeWithBuffer() }
 DataTests.test("test_validateMutation_slice_cow_customBacking_replaceSubrangeWithCollection") { TestData().test_validateMutation_slice_cow_customBacking_replaceSubrangeWithCollection() }
 DataTests.test("test_validateMutation_slice_cow_customBacking_replaceSubrangeWithBytes") { TestData().test_validateMutation_slice_cow_customBacking_replaceSubrangeWithBytes() }
@@ -3944,7 +4339,7 @@ DataTests.test("test_validateMutation_customMutableBacking_appendSequence") { Te
 DataTests.test("test_validateMutation_customMutableBacking_appendContentsOf") { TestData().test_validateMutation_customMutableBacking_appendContentsOf() }
 DataTests.test("test_validateMutation_customMutableBacking_resetBytes") { TestData().test_validateMutation_customMutableBacking_resetBytes() }
 DataTests.test("test_validateMutation_customMutableBacking_replaceSubrange") { TestData().test_validateMutation_customMutableBacking_replaceSubrange() }
-DataTests.test("test_validateMutation_customMutableBacking_replaceSubrangeCountableRange") { TestData().test_validateMutation_customMutableBacking_replaceSubrangeCountableRange() }
+DataTests.test("test_validateMutation_customMutableBacking_replaceSubrangeRange") { TestData().test_validateMutation_customMutableBacking_replaceSubrangeRange() }
 DataTests.test("test_validateMutation_customMutableBacking_replaceSubrangeWithBuffer") { TestData().test_validateMutation_customMutableBacking_replaceSubrangeWithBuffer() }
 DataTests.test("test_validateMutation_customMutableBacking_replaceSubrangeWithCollection") { TestData().test_validateMutation_customMutableBacking_replaceSubrangeWithCollection() }
 DataTests.test("test_validateMutation_customMutableBacking_replaceSubrangeWithBytes") { TestData().test_validateMutation_customMutableBacking_replaceSubrangeWithBytes() }
@@ -3956,7 +4351,7 @@ DataTests.test("test_validateMutation_slice_customMutableBacking_appendSequence"
 DataTests.test("test_validateMutation_slice_customMutableBacking_appendContentsOf") { TestData().test_validateMutation_slice_customMutableBacking_appendContentsOf() }
 DataTests.test("test_validateMutation_slice_customMutableBacking_resetBytes") { TestData().test_validateMutation_slice_customMutableBacking_resetBytes() }
 DataTests.test("test_validateMutation_slice_customMutableBacking_replaceSubrange") { TestData().test_validateMutation_slice_customMutableBacking_replaceSubrange() }
-DataTests.test("test_validateMutation_slice_customMutableBacking_replaceSubrangeCountableRange") { TestData().test_validateMutation_slice_customMutableBacking_replaceSubrangeCountableRange() }
+DataTests.test("test_validateMutation_slice_customMutableBacking_replaceSubrangeRange") { TestData().test_validateMutation_slice_customMutableBacking_replaceSubrangeRange() }
 DataTests.test("test_validateMutation_slice_customMutableBacking_replaceSubrangeWithBuffer") { TestData().test_validateMutation_slice_customMutableBacking_replaceSubrangeWithBuffer() }
 DataTests.test("test_validateMutation_slice_customMutableBacking_replaceSubrangeWithCollection") { TestData().test_validateMutation_slice_customMutableBacking_replaceSubrangeWithCollection() }
 DataTests.test("test_validateMutation_slice_customMutableBacking_replaceSubrangeWithBytes") { TestData().test_validateMutation_slice_customMutableBacking_replaceSubrangeWithBytes() }
@@ -3968,7 +4363,7 @@ DataTests.test("test_validateMutation_cow_customMutableBacking_appendSequence") 
 DataTests.test("test_validateMutation_cow_customMutableBacking_appendContentsOf") { TestData().test_validateMutation_cow_customMutableBacking_appendContentsOf() }
 DataTests.test("test_validateMutation_cow_customMutableBacking_resetBytes") { TestData().test_validateMutation_cow_customMutableBacking_resetBytes() }
 DataTests.test("test_validateMutation_cow_customMutableBacking_replaceSubrange") { TestData().test_validateMutation_cow_customMutableBacking_replaceSubrange() }
-DataTests.test("test_validateMutation_cow_customMutableBacking_replaceSubrangeCountableRange") { TestData().test_validateMutation_cow_customMutableBacking_replaceSubrangeCountableRange() }
+DataTests.test("test_validateMutation_cow_customMutableBacking_replaceSubrangeRange") { TestData().test_validateMutation_cow_customMutableBacking_replaceSubrangeRange() }
 DataTests.test("test_validateMutation_cow_customMutableBacking_replaceSubrangeWithBuffer") { TestData().test_validateMutation_cow_customMutableBacking_replaceSubrangeWithBuffer() }
 DataTests.test("test_validateMutation_cow_customMutableBacking_replaceSubrangeWithCollection") { TestData().test_validateMutation_cow_customMutableBacking_replaceSubrangeWithCollection() }
 DataTests.test("test_validateMutation_cow_customMutableBacking_replaceSubrangeWithBytes") { TestData().test_validateMutation_cow_customMutableBacking_replaceSubrangeWithBytes() }
@@ -3980,14 +4375,29 @@ DataTests.test("test_validateMutation_slice_cow_customMutableBacking_appendSeque
 DataTests.test("test_validateMutation_slice_cow_customMutableBacking_appendContentsOf") { TestData().test_validateMutation_slice_cow_customMutableBacking_appendContentsOf() }
 DataTests.test("test_validateMutation_slice_cow_customMutableBacking_resetBytes") { TestData().test_validateMutation_slice_cow_customMutableBacking_resetBytes() }
 DataTests.test("test_validateMutation_slice_cow_customMutableBacking_replaceSubrange") { TestData().test_validateMutation_slice_cow_customMutableBacking_replaceSubrange() }
-DataTests.test("test_validateMutation_slice_cow_customMutableBacking_replaceSubrangeCountableRange") { TestData().test_validateMutation_slice_cow_customMutableBacking_replaceSubrangeCountableRange() }
+DataTests.test("test_validateMutation_slice_cow_customMutableBacking_replaceSubrangeRange") { TestData().test_validateMutation_slice_cow_customMutableBacking_replaceSubrangeRange() }
 DataTests.test("test_validateMutation_slice_cow_customMutableBacking_replaceSubrangeWithBuffer") { TestData().test_validateMutation_slice_cow_customMutableBacking_replaceSubrangeWithBuffer() }
 DataTests.test("test_validateMutation_slice_cow_customMutableBacking_replaceSubrangeWithCollection") { TestData().test_validateMutation_slice_cow_customMutableBacking_replaceSubrangeWithCollection() }
 DataTests.test("test_validateMutation_slice_cow_customMutableBacking_replaceSubrangeWithBytes") { TestData().test_validateMutation_slice_cow_customMutableBacking_replaceSubrangeWithBytes() }
 DataTests.test("test_sliceHash") { TestData().test_sliceHash() }
 DataTests.test("test_slice_resize_growth") { TestData().test_slice_resize_growth() }
-DataTests.test("test_sliceEnumeration") { TestData().test_sliceEnumeration() }
 DataTests.test("test_hashEmptyData") { TestData().test_hashEmptyData() }
+DataTests.test("test_validateMutation_slice_withUnsafeMutableBytes_lengthLessThanLowerBound") { TestData().test_validateMutation_slice_withUnsafeMutableBytes_lengthLessThanLowerBound() }
+DataTests.test("test_validateMutation_slice_immutableBacking_withUnsafeMutableBytes_lengthLessThanLowerBound") { TestData().test_validateMutation_slice_immutableBacking_withUnsafeMutableBytes_lengthLessThanLowerBound() }
+DataTests.test("test_validateMutation_slice_mutableBacking_withUnsafeMutableBytes_lengthLessThanLowerBound") { TestData().test_validateMutation_slice_mutableBacking_withUnsafeMutableBytes_lengthLessThanLowerBound() }
+DataTests.test("test_validateMutation_slice_customBacking_withUnsafeMutableBytes_lengthLessThanLowerBound") { TestData().test_validateMutation_slice_customBacking_withUnsafeMutableBytes_lengthLessThanLowerBound() }
+DataTests.test("test_validateMutation_slice_customMutableBacking_withUnsafeMutableBytes_lengthLessThanLowerBound") { TestData().test_validateMutation_slice_customMutableBacking_withUnsafeMutableBytes_lengthLessThanLowerBound() }
+DataTests.test("test_byte_access_of_discontiguousData") { TestData().test_byte_access_of_discontiguousData() }
+DataTests.test("test_rangeOfSlice") { TestData().test_rangeOfSlice() }
+if #available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *) {
+    DataTests.test("test_nsdataSequence") { TestData().test_nsdataSequence() }
+    DataTests.test("test_dispatchSequence") { TestData().test_dispatchSequence() }
+}
+DataTests.test("test_increaseCount") { TestData().test_increaseCount() }
+DataTests.test("test_decreaseCount") { TestData().test_decreaseCount() }
+DataTests.test("test_increaseCount") { TestData().test_init_TestSequence() }
+DataTests.test("test_decreaseCount") { TestData().test_append_TestSequence() }
+
 
 // XCTest does not have a crash detection, whereas lit does
 DataTests.test("bounding failure subdata") {
@@ -4057,4 +4467,3 @@ DataTests.test("bounding failure subscript") {
 
 runAllTests()
 #endif
-

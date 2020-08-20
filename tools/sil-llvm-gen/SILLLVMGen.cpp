@@ -18,8 +18,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/AST/DiagnosticsFrontend.h"
+#include "swift/AST/IRGenRequests.h"
 #include "swift/AST/SILOptions.h"
-#include "swift/Basic/LLVMContext.h"
 #include "swift/Basic/LLVMInitialize.h"
 #include "swift/Frontend/DiagnosticVerifier.h"
 #include "swift/Frontend/Frontend.h"
@@ -88,11 +88,6 @@ static llvm::cl::opt<std::string>
 static llvm::cl::opt<bool>
     PerformWMO("wmo", llvm::cl::desc("Enable whole-module optimizations"));
 
-static llvm::cl::opt<bool> AssumeUnqualifiedOwnershipWhenParsing(
-    "assume-parsing-unqualified-ownership-sil", llvm::cl::Hidden,
-    llvm::cl::init(false),
-    llvm::cl::desc("Assume all parsed functions have unqualified ownership"));
-
 static llvm::cl::opt<IRGenOutputKind>
     OutputKind("output-kind", llvm::cl::desc("Type of output to produce"),
                llvm::cl::values(clEnumValN(IRGenOutputKind::LLVMAssembly,
@@ -105,6 +100,10 @@ static llvm::cl::opt<IRGenOutputKind>
                                            "object", "Emit an object file")),
                llvm::cl::init(IRGenOutputKind::ObjectFile));
 
+static llvm::cl::opt<bool>
+    DisableLegacyTypeInfo("disable-legacy-type-info",
+        llvm::cl::desc("Don't try to load backward deployment layouts"));
+
 // This function isn't referenced outside its translation unit, but it
 // can't use the "static" keyword because its address is used for
 // getMainExecutable (since some platforms don't support taking the
@@ -113,7 +112,8 @@ static llvm::cl::opt<IRGenOutputKind>
 void anchorForGetMainExecutable() {}
 
 int main(int argc, char **argv) {
-  INITIALIZE_LLVM(argc, argv);
+  PROGRAM_START(argc, argv);
+  INITIALIZE_LLVM();
 
   llvm::cl::ParseCommandLineOptions(argc, argv, "Swift LLVM IR Generator\n");
 
@@ -156,82 +156,64 @@ int main(int argc, char **argv) {
   LangOpts.EnableObjCAttrRequiresFoundation = false;
   LangOpts.EnableObjCInterop = LangOpts.Target.isOSDarwin();
 
-  // Setup the SIL Options.
-  SILOptions &SILOpts = Invocation.getSILOptions();
-  SILOpts.AssumeUnqualifiedOwnershipWhenParsing =
-      AssumeUnqualifiedOwnershipWhenParsing;
-
   // Setup the IRGen Options.
   IRGenOptions &Opts = Invocation.getIRGenOptions();
-  Opts.MainInputFilename = InputFilename;
-  Opts.OutputFilenames.push_back(OutputFilename);
   Opts.OutputKind = OutputKind;
+  Opts.DisableLegacyTypeInfo = DisableLegacyTypeInfo;
 
-  // Load the input file.
+  serialization::ExtendedValidationInfo extendedInfo;
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> FileBufOrErr =
-      llvm::MemoryBuffer::getFileOrSTDIN(InputFilename);
+      Invocation.setUpInputForSILTool(InputFilename, ModuleName,
+                                      /*alwaysSetModuleToMain*/ false,
+                                      /*bePrimary*/ !PerformWMO, extendedInfo);
   if (!FileBufOrErr) {
     fprintf(stderr, "Error! Failed to open file: %s\n", InputFilename.c_str());
     exit(-1);
-  }
-
-  // If it looks like we have an AST, set the source file kind to SIL and the
-  // name of the module to the file's name.
-  Invocation.addInputBuffer(FileBufOrErr.get().get());
-
-  serialization::ExtendedValidationInfo extendedInfo;
-  auto result = serialization::validateSerializedAST(
-      FileBufOrErr.get()->getBuffer(), &extendedInfo);
-  bool HasSerializedAST = result.status == serialization::Status::Valid;
-
-  if (HasSerializedAST) {
-    const StringRef Stem = ModuleName.size()
-                               ? StringRef(ModuleName)
-                               : llvm::sys::path::stem(InputFilename);
-    Invocation.setModuleName(Stem);
-    Invocation.setInputKind(InputFileKind::IFK_Swift_Library);
-  } else {
-    const StringRef Name = ModuleName.size() ? StringRef(ModuleName) : "main";
-    Invocation.setModuleName(Name);
-    Invocation.setInputKind(InputFileKind::IFK_SIL);
   }
 
   CompilerInstance CI;
   PrintingDiagnosticConsumer PrintDiags;
   CI.addDiagnosticConsumer(&PrintDiags);
 
-  if (!PerformWMO) {
-    Invocation.getFrontendOptions().Inputs.setPrimaryInputForInputFilename(
-        InputFilename);
-  }
-
   if (CI.setup(Invocation))
     return 1;
 
-  CI.performSema();
-
-  // If parsing produced an error, don't run any passes.
-  if (CI.getASTContext().hadError())
+  std::error_code EC;
+  llvm::raw_fd_ostream outStream(OutputFilename, EC, llvm::sys::fs::F_None);
+  if (outStream.has_error() || EC) {
+    CI.getDiags().diagnose(SourceLoc(), diag::error_opening_output,
+                           OutputFilename, EC.message());
+    outStream.clear_error();
     return 1;
-
-  // Load the SIL if we have a module. We have to do this after SILParse
-  // creating the unfortunate double if statement.
-  if (HasSerializedAST) {
-    assert(!CI.hasSILModule() &&
-           "performSema() should not create a SILModule.");
-    CI.setSILModule(SILModule::createEmptyModule(
-        CI.getMainModule(), CI.getSILOptions(), PerformWMO));
-    std::unique_ptr<SerializedSILLoader> SL = SerializedSILLoader::create(
-        CI.getASTContext(), CI.getSILModule(), nullptr);
-
-    if (extendedInfo.isSIB())
-      SL->getAllForModule(CI.getMainModule()->getName(), nullptr);
-    else
-      SL->getAll();
   }
 
-  std::unique_ptr<llvm::Module> Mod = performIRGeneration(
-      Opts, CI.getMainModule(), CI.takeSILModule(),
-      CI.getMainModule()->getName().str(), getGlobalLLVMContext());
-  return CI.getASTContext().hadError();
+  auto *mod = CI.getMainModule();
+  assert(mod->getFiles().size() == 1);
+
+  const auto &TBDOpts = Invocation.getTBDGenOptions();
+  const auto &SILOpts = Invocation.getSILOptions();
+  auto &SILTypes = CI.getSILTypes();
+  auto moduleName = CI.getMainModule()->getName().str();
+  const PrimarySpecificPaths PSPs(OutputFilename, InputFilename);
+
+  auto getDescriptor = [&]() -> IRGenDescriptor {
+    if (PerformWMO) {
+      return IRGenDescriptor::forWholeModule(
+          mod, Opts, TBDOpts, SILOpts, SILTypes,
+          /*SILMod*/ nullptr, moduleName, PSPs);
+    } else {
+      return IRGenDescriptor::forFile(mod->getFiles()[0], Opts, TBDOpts,
+                                      SILOpts, SILTypes, /*SILMod*/ nullptr,
+                                      moduleName, PSPs, /*discriminator*/ "");
+    }
+  };
+
+  auto &eval = CI.getASTContext().evaluator;
+  auto generatedMod = llvm::cantFail(eval(OptimizedIRRequest{getDescriptor()}));
+  if (!generatedMod)
+    return 1;
+
+  return compileAndWriteLLVM(generatedMod.getModule(),
+                             generatedMod.getTargetMachine(), Opts,
+                             CI.getStatsReporter(), CI.getDiags(), outStream);
 }

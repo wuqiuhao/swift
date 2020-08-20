@@ -75,7 +75,7 @@ struct P5Conformer : P5 { // expected-error {{does not conform}}
 
 
 protocol P6Base {
-  associatedtype Foo
+  associatedtype Foo // expected-note{{protocol requires nested type 'Foo'; do you want to add it?}}
   func foo()
   func bar() -> Foo
 }
@@ -88,7 +88,7 @@ extension P6 {
   func bar() -> Bar? { return nil }
 }
 
-struct P6Conformer : P6 { // expected-error {{does not conform}}
+struct P6Conformer : P6 { // expected-error 2 {{does not conform}}
   func foo() {}
 }
 
@@ -97,7 +97,7 @@ struct P6Conformer : P6 { // expected-error {{does not conform}}
 // expected-error@+1{{type 'A' does not conform to protocol 'RawRepresentable'}}
 struct A: OptionSet {
   let rawValue = 0
-  init() { } // expected-note 2{{candidate has non-matching type '()'}}
+  init() { }
 }
 
 // Type witness cannot have its own generic parameters

@@ -12,6 +12,7 @@
 
 #define DEBUG_TYPE "arc-sequence-opts"
 #include "ARCRegionState.h"
+#include "ARCSequenceOptUtils.h"
 #include "RCStateTransitionVisitors.h"
 #include "swift/Basic/Range.h"
 #include "swift/SILOptimizer/Analysis/LoopRegionAnalysis.h"
@@ -66,7 +67,7 @@ void ARCRegionState::mergeSuccBottomUp(ARCRegionState &SuccRegionState) {
     // effect of an intersection.
     auto Other = SuccRegionState.PtrToBottomUpState.find(RefCountedValue);
     if (Other == SuccRegionState.PtrToBottomUpState.end()) {
-      PtrToBottomUpState.blot(RefCountedValue);
+      PtrToBottomUpState.erase(RefCountedValue);
       continue;
     }
 
@@ -76,7 +77,7 @@ void ARCRegionState::mergeSuccBottomUp(ARCRegionState &SuccRegionState) {
     // This has the effect of an intersection since we already checked earlier
     // that RefCountedValue was not blotted.
     if (!OtherRefCountedValue) {
-      PtrToBottomUpState.blot(RefCountedValue);
+      PtrToBottomUpState.erase(RefCountedValue);
       continue;
     }
 
@@ -87,7 +88,7 @@ void ARCRegionState::mergeSuccBottomUp(ARCRegionState &SuccRegionState) {
     // of instructions which together semantically act as one ref count
     // increment. Merge the two states together.
     if (!RefCountState.merge(OtherRefCountState)) {
-      PtrToBottomUpState.blot(RefCountedValue);
+      PtrToBottomUpState.erase(RefCountedValue);
     }
   }
 }
@@ -123,7 +124,7 @@ void ARCRegionState::mergePredTopDown(ARCRegionState &PredRegionState) {
     // effect of an intersection.
     auto Other = PredRegionState.PtrToTopDownState.find(RefCountedValue);
     if (Other == PredRegionState.PtrToTopDownState.end()) {
-      PtrToTopDownState.blot(RefCountedValue);
+      PtrToTopDownState.erase(RefCountedValue);
       continue;
     }
 
@@ -132,7 +133,7 @@ void ARCRegionState::mergePredTopDown(ARCRegionState &PredRegionState) {
     // If the other ref count value was blotted, blot our value and continue.
     // This has the effect of an intersection.
     if (!OtherRefCountedValue) {
-      PtrToTopDownState.blot(RefCountedValue);
+      PtrToTopDownState.erase(RefCountedValue);
       continue;
     }
 
@@ -144,8 +145,8 @@ void ARCRegionState::mergePredTopDown(ARCRegionState &PredRegionState) {
     // Attempt to merge Other into this ref count state. If we fail, blot this
     // ref counted value and continue.
     if (!RefCountState.merge(OtherRefCountState)) {
-      DEBUG(llvm::dbgs() << "Failed to merge!\n");
-      PtrToTopDownState.blot(RefCountedValue);
+      LLVM_DEBUG(llvm::dbgs() << "Failed to merge!\n");
+      PtrToTopDownState.erase(RefCountedValue);
       continue;
     }
   }
@@ -154,77 +155,6 @@ void ARCRegionState::mergePredTopDown(ARCRegionState &PredRegionState) {
 //===---
 // Bottom Up Dataflow
 //
-
-static bool isARCSignificantTerminator(TermInst *TI) {
-  switch (TI->getTermKind()) {
-  case TermKind::UnreachableInst:
-  // br is a forwarding use for its arguments. It cannot in of itself extend
-  // the lifetime of an object (just like a phi-node) cannot.
-  case TermKind::BranchInst:
-  // A cond_br is a forwarding use for its non-operand arguments in a similar
-  // way to br. Its operand must be an i1 that has a different lifetime from any
-  // ref counted object.
-  case TermKind::CondBranchInst:
-    return false;
-  // Be conservative for now. These actually perform some sort of operation
-  // against the operand or can use the value in some way.
-  case TermKind::ThrowInst:
-  case TermKind::ReturnInst:
-  case TermKind::UnwindInst:
-  case TermKind::YieldInst:
-  case TermKind::TryApplyInst:
-  case TermKind::SwitchValueInst:
-  case TermKind::SwitchEnumInst:
-  case TermKind::SwitchEnumAddrInst:
-  case TermKind::DynamicMethodBranchInst:
-  case TermKind::CheckedCastBranchInst:
-  case TermKind::CheckedCastValueBranchInst:
-  case TermKind::CheckedCastAddrBranchInst:
-    return true;
-  }
-
-  llvm_unreachable("Unhandled TermKind in switch.");
-}
-
-// Visit each one of our predecessor regions and see if any are blocks that can
-// use reference counted values. If any of them do, we advance the sequence for
-// the pointer and create an insertion point here. This state will be propagated
-// into all of our predecessors, allowing us to be conservatively correct in all
-// cases.
-//
-// The key thing to notice is that in general this cannot happen due to
-// critical edge splitting. To trigger this, one would need a terminator that
-// uses a reference counted value and only has one successor due to critical
-// edge splitting. This is just to be conservative when faced with the unknown
-// of future changes.
-//
-// We do not need to worry about loops here, since a loop exit block can only
-// have predecessors in the loop itself implying that loop exit blocks at the
-// loop region level always have only one predecessor, the loop itself.
-void ARCRegionState::processBlockBottomUpPredTerminators(
-    const LoopRegion *R, AliasAnalysis *AA, LoopRegionFunctionInfo *LRFI,
-    ImmutablePointerSetFactory<SILInstruction> &SetFactory) {
-  llvm::TinyPtrVector<SILInstruction *> PredTerminators;
-  for (unsigned PredID : R->getPreds()) {
-    auto *PredRegion = LRFI->getRegion(PredID);
-    if (!PredRegion->isBlock())
-      continue;
-
-    auto *TermInst = PredRegion->getBlock()->getTerminator();
-    if (!isARCSignificantTerminator(TermInst))
-      continue;
-    PredTerminators.push_back(TermInst);
-  }
-
-  for (auto &OtherState : getBottomupStates()) {
-    // If the other state's value is blotted, skip it.
-    if (!OtherState.hasValue())
-      continue;
-
-    OtherState->second.updateForPredTerminators(PredTerminators,
-                                                SetFactory, AA);
-  }
-}
 
 static bool processBlockBottomUpInsts(
     ARCRegionState &State, SILBasicBlock &BB,
@@ -239,9 +169,9 @@ static bool processBlockBottomUpInsts(
   if (II == IE)
     return false;
 
-  // If II is the terminator, skip it since our terminator was already processed
-  // in our successors.
-  if (*II == BB.getTerminator())
+  // If II is not an arc significant terminator, skip it.
+  if (*II == BB.getTerminator() &&
+      !isARCSignificantTerminator(cast<TermInst>(*II)))
     ++II;
 
   bool NestingDetected = false;
@@ -249,7 +179,7 @@ static bool processBlockBottomUpInsts(
     SILInstruction *I = *II;
     ++II;
 
-    DEBUG(llvm::dbgs() << "VISITING:\n    " << *I);
+    LLVM_DEBUG(llvm::dbgs() << "VISITING:\n    " << *I);
 
     auto Result = DataflowVisitor.visit(I);
 
@@ -291,24 +221,16 @@ bool ARCRegionState::processBlockBottomUp(
     bool FreezeOwnedArgEpilogueReleases,
     BlotMapVector<SILInstruction *, BottomUpRefCountState> &IncToDecStateMap,
     ImmutablePointerSetFactory<SILInstruction> &SetFactory) {
-  DEBUG(llvm::dbgs() << ">>>> Bottom Up!\n");
+  LLVM_DEBUG(llvm::dbgs() << ">>>> Bottom Up!\n");
 
   SILBasicBlock &BB = *R->getBlock();
   BottomUpDataflowRCStateVisitor<ARCRegionState> DataflowVisitor(
       RCIA, EAFI, *this, FreezeOwnedArgEpilogueReleases, IncToDecStateMap,
       SetFactory);
 
-  // Visit each non-terminator arc relevant instruction I in BB visited in
-  // reverse...
+  // Visit each arc relevant instruction I in BB visited in reverse...
   bool NestingDetected =
       processBlockBottomUpInsts(*this, BB, DataflowVisitor, AA, SetFactory);
-
-  // Now visit each one of our predecessor regions and see if any are blocks
-  // that can use reference counted values. If any of them do, we advance the
-  // sequence for the pointer and create an insertion point here. This state
-  // will be propagated into all of our predecessors, allowing us to be
-  // conservatively correct in all cases.
-  processBlockBottomUpPredTerminators(R, AA, LRFI, SetFactory);
 
   return NestingDetected;
 }
@@ -402,7 +324,7 @@ bool ARCRegionState::processBlockTopDown(
     SILBasicBlock &BB, AliasAnalysis *AA, RCIdentityFunctionInfo *RCIA,
     BlotMapVector<SILInstruction *, TopDownRefCountState> &DecToIncStateMap,
     ImmutablePointerSetFactory<SILInstruction> &SetFactory) {
-  DEBUG(llvm::dbgs() << ">>>> Top Down!\n");
+  LLVM_DEBUG(llvm::dbgs() << ">>>> Top Down!\n");
 
   bool NestingDetected = false;
 
@@ -427,7 +349,7 @@ bool ARCRegionState::processBlockTopDown(
   // For each instruction I in BB...
   for (auto *I : SummarizedInterestingInsts) {
 
-    DEBUG(llvm::dbgs() << "VISITING:\n    " << *I);
+    LLVM_DEBUG(llvm::dbgs() << "VISITING:\n    " << *I);
 
     auto Result = DataflowVisitor.visit(I);
 
@@ -531,7 +453,9 @@ void ARCRegionState::summarizeBlock(SILBasicBlock *BB) {
   SummarizedInterestingInsts.clear();
 
   for (auto &I : *BB)
-    if (!canNeverUseValues(&I) || I.mayReleaseOrReadRefCount() ||
+    // FIXME: mayReleaseOrReadRefCount should be a strict subset of
+    // canUseObject. If not, there is a bug in canUseObject.
+    if (canUseObject(&I) || I.mayReleaseOrReadRefCount() ||
         isStrongEntranceInstruction(I))
       SummarizedInterestingInsts.push_back(&I);
 }

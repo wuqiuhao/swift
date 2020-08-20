@@ -21,8 +21,8 @@ ManagedValue Scope::popPreservingValue(ManagedValue mv) {
   // that we want to make sure that we are not forwarding a cleanup for a
   // stack location that will be destroyed by this scope.
   assert(mv && mv.getType().isObject() &&
-         (mv.getType().isTrivial(cleanups.SGF.getModule()) ||
-          mv.getOwnershipKind() == ValueOwnershipKind::Trivial ||
+         (mv.getType().isTrivial(cleanups.SGF.F) ||
+          mv.getOwnershipKind() == ValueOwnershipKind::None ||
           mv.hasCleanup()));
   CleanupCloner cloner(cleanups.SGF, mv);
   SILValue value = mv.forward(cleanups.SGF);
@@ -53,10 +53,10 @@ static void lifetimeExtendAddressOnlyRValueSubValues(
     }
 
     // Otherwise, create the box and move the address only value into the box.
-    assert(v->getType().isAddressOnly(SGF.getModule()) &&
+    assert(v->getType().isAddressOnly(SGF.F) &&
            "RValue invariants imply that all RValue subtypes that are "
            "addresses must be address only.");
-    auto boxTy = SILBoxType::get(v->getType().getSwiftRValueType());
+    auto boxTy = SILBoxType::get(v->getType().getASTType());
     SILValue box = SGF.B.createAllocBox(loc, boxTy);
     SILValue addr = SGF.B.createProjectBox(loc, box, 0);
     SGF.B.createCopyAddr(loc, v, addr, IsTake, IsInitialization);
@@ -86,12 +86,14 @@ RValue Scope::popPreservingValue(RValue &&rv) {
   // recreate the RValue in the outer scope.
   CanType type = rv.type;
   unsigned numEltsRemaining = rv.elementsToBeAdded;
-  CleanupCloner cloner(SGF, rv);
-  llvm::SmallVector<SILValue, 4> values;
+  SmallVector<CleanupCloner, 4> cloners;
+  CleanupCloner::getClonersForRValue(SGF, rv, cloners);
+
+  SmallVector<SILValue, 4> values;
   std::move(rv).forwardAll(SGF, values);
 
   // Lifetime any address only values that we may have.
-  llvm::SmallVector<SILValue, 4> lifetimeExtendingBoxes;
+  SmallVector<SILValue, 4> lifetimeExtendingBoxes;
   lifetimeExtendAddressOnlyRValueSubValues(SGF, loc, values,
                                            lifetimeExtendingBoxes);
 
@@ -111,46 +113,25 @@ RValue Scope::popPreservingValue(RValue &&rv) {
   // Reconstruct the managed values from the underlying sil values in the outer
   // scope. Since the RValue wants a std::vector value, we use that instead.
   std::vector<ManagedValue> managedValues;
-  std::transform(
-      values.begin(), values.end(), std::back_inserter(managedValues),
-      [&cloner](SILValue v) -> ManagedValue { return cloner.clone(v); });
+  for (unsigned i : indices(values)) {
+    managedValues.push_back(cloners[i].clone(values[i]));
+  }
 
   // And then assemble the managed values into a rvalue.
   return RValue(SGF, std::move(managedValues), type, numEltsRemaining);
 }
 
-void Scope::popPreservingValues(ArrayRef<ManagedValue> innerValues,
-                                MutableArrayRef<ManagedValue> outerValues) {
-  auto &SGF = cleanups.SGF;
-  assert(innerValues.size() == outerValues.size());
-
-  // Record the cleanup information for each preserved value and deactivate its
-  // cleanup.
-  SmallVector<CleanupCloner, 4> cleanups;
-  cleanups.reserve(innerValues.size());
-  for (auto &mv : innerValues) {
-    cleanups.emplace_back(SGF, mv);
-    mv.forward(SGF);
-  }
-
-  // Pop any unpreserved cleanups.
-  pop();
-
-  // Create a managed value for each preserved value, cloning its cleanup.
-  // Since the CleanupCloner does not remember its SILValue, grab it from the
-  // original, now-deactivated managed value.
-  for (auto index : indices(innerValues)) {
-    outerValues[index] = cleanups[index].clone(innerValues[index].getValue());
-  }
-}
-
 void Scope::popImpl() {
-  cleanups.stack.checkIterator(depth);
-  cleanups.stack.checkIterator(cleanups.innermostScope);
-  assert(cleanups.innermostScope == depth && "popping scopes out of order");
-
+  verify();
   cleanups.innermostScope = savedInnermostScope;
   cleanups.endScope(depth, loc);
-  cleanups.stack.checkIterator(cleanups.innermostScope);
-  cleanups.popTopDeadCleanups(cleanups.innermostScope);
+  if (cleanups.innermostScope)
+    cleanups.stack.checkIterator(cleanups.innermostScope->depth);
+  cleanups.popTopDeadCleanups();
+}
+
+void Scope::verify() {
+  assert(cleanups.innermostScope == this && "popping scopes out of order");
+  assert(depth.isValid());
+  cleanups.stack.checkIterator(depth);
 }

@@ -22,27 +22,27 @@
 #include "LibcShims.h"
 
 #ifdef __cplusplus
-namespace swift { extern "C" {
+extern "C" {
 #endif
 
 SWIFT_BEGIN_NULLABILITY_ANNOTATIONS
 
-SWIFT_RUNTIME_STDLIB_INTERFACE
+SWIFT_RUNTIME_STDLIB_API
 __swift_ssize_t
 swift_stdlib_readLine_stdin(unsigned char * _Nullable * _Nonnull LinePtr);
 
-SWIFT_RUNTIME_STDLIB_INTERFACE
+SWIFT_RUNTIME_STDLIB_API
 char * _Nullable * _Nonnull
 _swift_stdlib_getUnsafeArgvArgc(int * _Nonnull outArgLen);
   
-SWIFT_RUNTIME_STDLIB_INTERFACE
+SWIFT_RUNTIME_STDLIB_API
 void
 _swift_stdlib_overrideUnsafeArgvArgc(char * _Nullable * _Nonnull argv, int argc);
 
 SWIFT_END_NULLABILITY_ANNOTATIONS
 
 #ifdef __cplusplus
-}} // extern "C", namespace swift
+} // extern "C"
 #endif
 
 #endif // SWIFT_STDLIB_SHIMS_RUNTIMESTUBS_H_

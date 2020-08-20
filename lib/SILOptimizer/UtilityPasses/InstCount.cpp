@@ -44,6 +44,7 @@ STATISTIC(TotalExternalFuncDecls, "Number of external funcs declarations");
 
 // Linkage statistics
 STATISTIC(TotalPublicFuncs, "Number of public funcs");
+STATISTIC(TotalPublicNonABIFuncs, "Number of public non-ABI funcs");
 STATISTIC(TotalHiddenFuncs, "Number of hidden funcs");
 STATISTIC(TotalPrivateFuncs, "Number of private funcs");
 STATISTIC(TotalSharedFuncs, "Number of shared funcs");
@@ -66,7 +67,7 @@ struct InstCountVisitor : SILInstructionVisitor<InstCountVisitor> {
   unsigned BlockCount = 0;
 
   void visitSILBasicBlock(SILBasicBlock *BB) {
-    BlockCount++;
+    ++BlockCount;
     SILInstructionVisitor<InstCountVisitor>::visitSILBasicBlock(BB);
   }
 
@@ -103,19 +104,22 @@ class InstCount : public SILFunctionTransform {
       if (F->isDefinition()) {
         TotalExternalFuncInsts += V.InstCount;
         TotalExternalFuncBlocks += V.BlockCount;
-        TotalExternalFuncDefs++;
+        ++TotalExternalFuncDefs;
       } else {
-        TotalExternalFuncDecls++;
+        ++TotalExternalFuncDecls;
       }
     } else {
       TotalInsts += V.InstCount;
       TotalBlocks += V.BlockCount;
-      TotalFuncs++;
+      ++TotalFuncs;
     }
 
     switch (F->getLinkage()) {
     case SILLinkage::Public:
       ++TotalPublicFuncs;
+      break;
+    case SILLinkage::PublicNonABI:
+      ++TotalPublicNonABIFuncs;
       break;
     case SILLinkage::Hidden:
       ++TotalHiddenFuncs;
@@ -148,8 +152,9 @@ SILTransform *swift::createInstCount() {
   return new InstCount();
 }
 
-void swift::performSILInstCount(SILModule *M) {
-  SILPassManager PrinterPM(M);
-  PrinterPM.executePassPipelinePlan(
-      SILPassPipelinePlan::getInstCountPassPipeline());
+void swift::performSILInstCountIfNeeded(SILModule *M) {
+  if (!M->getOptions().PrintInstCounts)
+    return;
+  executePassPipelinePlan(
+      M, SILPassPipelinePlan::getInstCountPassPipeline(M->getOptions()));
 }

@@ -193,10 +193,10 @@ void DocStructureArrayBuilder::beginSubStructure(
       BodyLength,
       DocOffset,
       DocLength,
-      DisplayName,
-      TypeName,
-      RuntimeName,
-      SelectorName,
+      DisplayName.str(),
+      TypeName.str(),
+      RuntimeName.str(),
+      SelectorName.str(),
       impl.addInheritedTypes(InheritedTypes),
       impl.addAttrs(Attrs),
       {}, // elements
@@ -244,16 +244,21 @@ std::unique_ptr<llvm::MemoryBuffer> DocStructureArrayBuilder::createBuffer() {
   size_t structureArrayBufferSize = impl.structureArrayBuffer.size();
   size_t structureBufferSize = impl.structureBuilder.sizeInBytes();
 
+  size_t kindSize = sizeof(uint64_t);
+
   // Header:
   // * offset of each section start (5)
   // * offset of top structure array (relative to structure array section) (1)
   size_t headerSize = sizeof(uint64_t) * 6;
 
-  auto result = llvm::MemoryBuffer::getNewUninitMemBuffer(
+  auto result = llvm::WritableMemoryBuffer::getNewUninitMemBuffer(
       inheritedTypesBufferSize + attrsBufferSize + elementsBufferSize +
-      structureArrayBufferSize + structureBufferSize + headerSize);
+      structureArrayBufferSize + structureBufferSize + headerSize + kindSize);
 
-  char *start = const_cast<char *>(result->getBufferStart());
+  *reinterpret_cast<uint64_t *>(result->getBufferStart()) =
+      (uint64_t)CustomBufferKind::DocStructureArray;
+
+  char *start = result->getBufferStart() + kindSize;
   char *headerPtr = start;
   char *ptr = start + headerSize;
 
@@ -277,7 +282,7 @@ std::unique_ptr<llvm::MemoryBuffer> DocStructureArrayBuilder::createBuffer() {
   assert(headerPtr == start + (headerSize - sizeof(topOffset)));
   memcpy(headerPtr, &topOffset, sizeof(topOffset));
 
-  return result;
+  return std::move(result);
 }
 
 namespace {
@@ -579,7 +584,9 @@ VariantFunctions DocStructureArrayFuncs::funcs = {
     nullptr /*AnnotArray_string_get_length*/,
     nullptr /*AnnotArray_string_get_ptr*/,
     nullptr /*AnnotArray_int64_get_value*/,
-    nullptr /*AnnotArray_uid_get_value*/
+    nullptr /*AnnotArray_uid_get_value*/,
+    nullptr /*Annot_data_get_size*/,
+    nullptr /*Annot_data_get_ptr*/,
 };
 
 VariantFunctions *sourcekitd::getVariantFunctionsForDocStructureElementArray() {

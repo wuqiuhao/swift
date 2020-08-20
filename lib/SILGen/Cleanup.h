@@ -19,6 +19,7 @@
 
 #include "swift/Basic/DiverseStack.h"
 #include "swift/SIL/SILLocation.h"
+#include "swift/SIL/SILValue.h"
 #include "llvm/ADT/SmallVector.h"
 
 namespace swift {
@@ -34,8 +35,24 @@ class JumpDest;
 class SILGenFunction;
 class SILGenBuilder;
 class ManagedValue;
+class Scope;
 class SharedBorrowFormalAccess;
 class FormalEvaluationScope;
+
+/// Is a cleanup being executed as a result of some sort of forced
+/// unwinding, such as an error being thrown, or are we just cleaning up
+/// after some operation?
+///
+/// Most cleanups don't care, but the cleanups tied to l-value accesses do:
+/// the access will be aborted rather than ended normally, which may cause
+/// e.g. writebacks to be skipped.  It is also important that no actions
+/// be undertaken by an unwind cleanup that might change control flow,
+/// such as throwing an error.  In contrast, non-unwinding cleanups are
+/// permitted to change control flow.
+enum ForUnwind_t : bool {
+  NotForUnwind,
+  IsForUnwind
+};
 
 /// The valid states that a cleanup can be in.
 enum class CleanupState {
@@ -59,12 +76,25 @@ llvm::raw_ostream &operator<<(raw_ostream &os, CleanupState state);
 
 class LLVM_LIBRARY_VISIBILITY Cleanup {
   friend class CleanupManager;
-
-  unsigned allocatedSize;
+  friend class CleanupCloner;
 
 protected:
-  CleanupState state;
+  // A set of flags that categorize the type of cleanup such that it can be
+  // recreated via SILGenFunction methods based on the type of argument input.
+  //
+  // Example: Distinguishing in between @owned cleanups with a writeback buffer
+  // (ExclusiveBorrowCleanup) or ones that involve formal access cleanups.
+  enum class Flags : uint8_t {
+    None = 0,
+    ExclusiveBorrowCleanup = 1,
+  };
 
+private:
+  CleanupState state;
+  unsigned allocatedSize : 24;
+  Flags flags : 8;
+
+protected:
   Cleanup() {}
   virtual ~Cleanup() {}
 
@@ -80,8 +110,19 @@ public:
   bool isActive() const { return state >= CleanupState::Active; }
   bool isDead() const { return state == CleanupState::Dead; }
 
-  virtual void emit(SILGenFunction &SGF, CleanupLocation loc) = 0;
+  virtual void emit(SILGenFunction &SGF, CleanupLocation loc,
+                    ForUnwind_t forUnwind) = 0;
   virtual void dump(SILGenFunction &SGF) const = 0;
+
+protected:
+  Flags getFlags() const { return flags; }
+
+  /// Call func passing in the SILValue address that this cleanup will write
+  /// back to if supported and any flags associated with the cleanup. Returns
+  /// false otherwise.
+  virtual bool getWritebackBuffer(function_ref<void(SILValue)> func) {
+    return false;
+  }
 };
 
 /// A cleanup depth is generally used to denote the set of cleanups
@@ -100,6 +141,7 @@ typedef DiverseStackImpl<Cleanup>::stable_iterator CleanupHandle;
 
 class LLVM_LIBRARY_VISIBILITY CleanupManager {
   friend class Scope;
+  friend class CleanupCloner;
 
   SILGenFunction &SGF;
 
@@ -116,11 +158,12 @@ class LLVM_LIBRARY_VISIBILITY CleanupManager {
   /// only really care about those held by the Scope RAII objects.  So
   /// we can only reap the cleanup stack up to the innermost depth
   /// that we've handed out as a Scope.
-  CleanupsDepth innermostScope;
+  Scope *innermostScope = nullptr;
+  FormalEvaluationScope *innermostFormalScope = nullptr;
 
-  void popTopDeadCleanups(CleanupsDepth end);
+  void popTopDeadCleanups();
   void emitCleanups(CleanupsDepth depth, CleanupLocation l,
-                    bool popCleanups=true);
+                    ForUnwind_t forUnwind, bool popCleanups);
   void endScope(CleanupsDepth depth, CleanupLocation l);
 
   Cleanup &initCleanup(Cleanup &cleanup, size_t allocSize, CleanupState state);
@@ -132,7 +175,7 @@ class LLVM_LIBRARY_VISIBILITY CleanupManager {
 
 public:
   CleanupManager(SILGenFunction &SGF)
-      : SGF(SGF), innermostScope(stack.stable_end()) {}
+      : SGF(SGF) {}
 
   /// Return a stable reference to the last cleanup pushed.
   CleanupsDepth getCleanupsDepth() const { return stack.stable_begin(); }
@@ -142,8 +185,16 @@ public:
     assert(!stack.empty());
     return stack.stable_begin();
   }
+  
+  Cleanup &getCleanup(CleanupHandle iter) {
+    return *stack.find(iter);
+  }
 
-  /// \brief Emit a branch to the given jump destination,
+  Cleanup &findAndAdvance(CleanupsDepth &iter) {
+    return stack.findAndAdvance(iter);
+  }
+
+  /// Emit a branch to the given jump destination,
   /// threading out through any cleanups we need to run. This does not pop the
   /// cleanup stack.
   ///
@@ -151,17 +202,19 @@ public:
   /// \param branchLoc  The location of the branch instruction.
   /// \param args       Arguments to pass to the destination block.
   void emitBranchAndCleanups(JumpDest dest, SILLocation branchLoc,
-                             ArrayRef<SILValue> args = {});
+                             ArrayRef<SILValue> args = {},
+                             ForUnwind_t forUnwind = NotForUnwind);
 
   /// emitCleanupsForReturn - Emit the top-level cleanups needed prior to a
   /// return from the function.
-  void emitCleanupsForReturn(CleanupLocation loc);
+  void emitCleanupsForReturn(CleanupLocation loc, ForUnwind_t forUnwind);
 
   /// Emit a new block that jumps to the specified location and runs necessary
   /// cleanups based on its level.  If there are no cleanups to run, this just
   /// returns the dest block.
   SILBasicBlock *emitBlockForCleanups(JumpDest dest, SILLocation branchLoc,
-                                      ArrayRef<SILValue> args = {});
+                                      ArrayRef<SILValue> args = {},
+                                      ForUnwind_t forUnwind = NotForUnwind);
 
   /// pushCleanup - Push a new cleanup.
   template<class T, class... A>
@@ -189,6 +242,10 @@ public:
                                        ::std::forward<A>(args)...);
   }
 
+  /// Emit the given active cleanup now and transition it to being inactive.
+  void popAndEmitCleanup(CleanupHandle handle, CleanupLocation loc,
+                         ForUnwind_t forUnwind);
+
   /// Transition the given active cleanup to the corresponding
   /// inactive state: Active becomes Dead and PersistentlyActive
   /// becomes Dormant.
@@ -197,7 +254,7 @@ public:
   /// Set the state of the cleanup at the given depth.
   /// The transition must be non-trivial and legal.
   void setCleanupState(CleanupHandle depth, CleanupState state);
-  
+
   /// True if there are any active cleanups in the scope between the two
   /// cleanup handles.
   bool hasAnyActiveCleanups(CleanupsDepth from, CleanupsDepth to);
@@ -214,6 +271,12 @@ public:
 
   /// Verify that the given cleanup handle is valid.
   void checkIterator(CleanupHandle handle) const;
+
+private:
+  // Look up the flags and optionally the writeback address associated with the
+  // cleanup at \p depth. If
+  std::tuple<Cleanup::Flags, Optional<SILValue>>
+  getFlagsAndWritebackBuffer(CleanupHandle depth);
 };
 
 /// An RAII object that allows the state of a cleanup to be
@@ -242,18 +305,28 @@ private:
   void popImpl();
 };
 
+/// Extract enough information from a managed value to reliably clone its
+/// cleanup (if it has any) on a newly computed type. This includes modeling
+/// writeback buffers.
 class CleanupCloner {
   SILGenFunction &SGF;
   bool hasCleanup;
   bool isLValue;
+  Optional<SILValue> writebackBuffer;
 
 public:
   CleanupCloner(SILGenFunction &SGF, const ManagedValue &mv);
   CleanupCloner(SILGenBuilder &builder, const ManagedValue &mv);
-  CleanupCloner(SILGenFunction &SGF, const RValue &rv);
-  CleanupCloner(SILGenBuilder &builder, const RValue &rv);
 
   ManagedValue clone(SILValue value) const;
+
+  static void
+  getClonersForRValue(SILGenFunction &SGF, const RValue &rvalue,
+                      SmallVectorImpl<CleanupCloner> &resultingCloners);
+
+  static void
+  getClonersForRValue(SILGenBuilder &builder, const RValue &rvalue,
+                      SmallVectorImpl<CleanupCloner> &resultingCloners);
 };
 
 } // end namespace Lowering

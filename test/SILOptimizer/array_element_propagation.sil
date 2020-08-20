@@ -1,27 +1,28 @@
-// RUN: %target-sil-opt -assume-parsing-unqualified-ownership-sil -array-element-propagation %s | %FileCheck %s
+
+// RUN: %target-sil-opt -array-element-propagation %s | %FileCheck %s
 sil_stage canonical
 
 import Builtin
 import Swift
 
 struct MyInt {
-  @sil_stored var _value: Builtin.Int64
+  @_hasStorage var _value: Builtin.Int64
 }
 
 struct MyBool {}
 struct _MyDependenceToken {}
 
 struct _MyBridgeStorage {
-  @sil_stored var rawValue : Builtin.BridgeObject
+  @_hasStorage var rawValue : Builtin.BridgeObject
 }
 
 struct _MyArrayBuffer<T> {
-  @sil_stored var _storage : _MyBridgeStorage
+  @_hasStorage var _storage : _MyBridgeStorage
 }
 
 
 struct MyArray<T> {
-  @sil_stored var _buffer : _MyArrayBuffer<T>
+  @_hasStorage var _buffer : _MyArrayBuffer<T>
 }
 
 sil @swift_bufferAllocate : $@convention(thin)() -> @owned AnyObject
@@ -33,6 +34,7 @@ sil [_semantics "array.get_element"] @getElement2 : $@convention(method) (MyInt,
 sil @unknown_array_use : $@convention(method) (@guaranteed MyArray<MyInt>) -> MyBool
 sil [_semantics "array.uninitialized"] @arrayAdoptStorage : $@convention(thin) (@owned AnyObject, MyInt, @thin Array<MyInt>.Type) -> @owned (Array<MyInt>, UnsafeMutablePointer<MyInt>)
 sil @arrayInit : $@convention(method) (@thin Array<MyInt>.Type) -> @owned Array<MyInt>
+sil [_semantics "array.finalize_intrinsic"] @finalize : $@convention(thin) (@owned MyArray<MyInt>) -> @owned MyArray<MyInt>
 sil [_semantics "array.append_contentsOf"] @arrayAppendContentsOf : $@convention(method) (@owned Array<MyInt>, @inout Array<MyInt>) -> ()
 
 // CHECK-LABEL: sil @propagate01
@@ -87,35 +89,37 @@ sil @propagate01 : $@convention(thin) () -> () {
   %19 = integer_literal $Builtin.Int64, 2
   %20 = struct $MyInt (%19 : $Builtin.Int64)
   store %20 to %18 : $*MyInt
-  %23 = struct_extract %7 : $MyArray<MyInt>, #MyArray._buffer
+  %f = function_ref @finalize : $@convention(thin) (@owned MyArray<MyInt>) -> @owned MyArray<MyInt>
+  %a = apply %f(%7) : $@convention(thin) (@owned MyArray<MyInt>) -> @owned MyArray<MyInt>
+  %23 = struct_extract %a : $MyArray<MyInt>, #MyArray._buffer
   %24 = struct_extract %23 : $_MyArrayBuffer<MyInt>, #_MyArrayBuffer._storage
   %25 = struct_extract %24 : $_MyBridgeStorage, #_MyBridgeStorage.rawValue
   %26 = alloc_stack $MyInt
-  debug_value %7 : $MyArray<MyInt>
+  debug_value %a : $MyArray<MyInt>
   %27 = function_ref @hoistableIsNativeTypeChecked : $@convention(method) (@guaranteed MyArray<MyInt>) -> MyBool
-  %28 = apply %27(%7) : $@convention(method) (@guaranteed MyArray<MyInt>) -> MyBool
+  %28 = apply %27(%a) : $@convention(method) (@guaranteed MyArray<MyInt>) -> MyBool
   debug_value %28 : $MyBool                        // id: %104
   %29 = function_ref @checkSubscript : $@convention(method) (MyInt, MyBool, @guaranteed MyArray<MyInt>) -> _MyDependenceToken
-  %30 = apply %29(%12, %28, %7) : $@convention(method) (MyInt, MyBool, @guaranteed MyArray<MyInt>) -> _MyDependenceToken
+  %30 = apply %29(%12, %28, %a) : $@convention(method) (MyInt, MyBool, @guaranteed MyArray<MyInt>) -> _MyDependenceToken
   debug_value %30 : $_MyDependenceToken
   %31 = function_ref @getElement : $@convention(method) (MyInt, MyBool, _MyDependenceToken, @guaranteed MyArray<MyInt>) -> @out MyInt
-  %32 = apply %31(%26, %12, %28, %30, %7) : $@convention(method) (MyInt, MyBool, _MyDependenceToken, @guaranteed MyArray<MyInt>) -> @out MyInt
+  %32 = apply %31(%26, %12, %28, %30, %a) : $@convention(method) (MyInt, MyBool, _MyDependenceToken, @guaranteed MyArray<MyInt>) -> @out MyInt
   %35 = alloc_stack $MyInt
   debug_value %16 : $MyInt
-  debug_value %7 : $MyArray<MyInt>
+  debug_value %a : $MyArray<MyInt>
   debug_value %28 : $MyBool
   strong_retain %25 : $Builtin.BridgeObject
-  %36 = apply %29(%16, %28, %7) : $@convention(method) (MyInt, MyBool, @guaranteed MyArray<MyInt>) -> _MyDependenceToken
+  %36 = apply %29(%16, %28, %a) : $@convention(method) (MyInt, MyBool, @guaranteed MyArray<MyInt>) -> _MyDependenceToken
   debug_value %36 : $_MyDependenceToken
-  %37 = apply %31(%35, %16, %28, %36, %7) : $@convention(method) (MyInt, MyBool, _MyDependenceToken, @guaranteed MyArray<MyInt>) -> @out MyInt
+  %37 = apply %31(%35, %16, %28, %36, %a) : $@convention(method) (MyInt, MyBool, _MyDependenceToken, @guaranteed MyArray<MyInt>) -> @out MyInt
   strong_release %25 : $Builtin.BridgeObject
   %44 = alloc_stack $MyInt
-  debug_value %7 : $MyArray<MyInt>
+  debug_value %a : $MyArray<MyInt>
   debug_value %28 : $MyBool
   strong_retain %25 : $Builtin.BridgeObject
-  %45 = apply %29(%20, %28, %7) : $@convention(method) (MyInt, MyBool, @guaranteed MyArray<MyInt>) -> _MyDependenceToken
+  %45 = apply %29(%20, %28, %a) : $@convention(method) (MyInt, MyBool, @guaranteed MyArray<MyInt>) -> _MyDependenceToken
   debug_value %45 : $_MyDependenceToken
-  %46 = apply %31(%44, %20, %28, %45, %7) : $@convention(method) (MyInt, MyBool, _MyDependenceToken, @guaranteed MyArray<MyInt>) -> @out MyInt
+  %46 = apply %31(%44, %20, %28, %45, %a) : $@convention(method) (MyInt, MyBool, _MyDependenceToken, @guaranteed MyArray<MyInt>) -> @out MyInt
   strong_release %25 : $Builtin.BridgeObject
   %52 = tuple ()
   dealloc_stack %44 : $*MyInt
@@ -309,7 +313,7 @@ sil @unknown_use : $@convention(thin) () -> () {
 // CHECK-NEXT: [[ARR:%.*]] = apply [[ASFUN]]
 // CHECK-NEXT: [[OWNER:%.*]] = tuple_extract [[ARR]]{{.*}}, 0
 // CHECK-NOT:    apply [[ACFUN]]
-// CHECK:      [[AEFUN:%.*]] = function_ref @_T0Sa6appendyxF
+// CHECK:      [[AEFUN:%.*]] = function_ref @$sSa6appendyyxnF
 // CHECK-NEXT: [[STACK:%.*]] = alloc_stack $MyInt
 // CHECK-NEXT: store %{{[0-9]+}} to [[STACK]]
 // CHECK-NEXT: apply [[AEFUN]]<MyInt>([[STACK]]
@@ -356,7 +360,7 @@ sil [_semantics "array.append_contentsOf"] @arrayAppendContentsOfHello : $@conve
 // CHECK:      strong_retain %1 : $Hello
 // CHECK-NEXT: store %1 to %{{[0-9]+}} : $*Hello
 // CHECK-NOT:     apply
-// CHECK:      [[AEFUN:%.*]] = function_ref @_T0Sa6appendyxF
+// CHECK:      [[AEFUN:%.*]] = function_ref @$sSa6appendyyxnF
 // CHECK-NEXT: strong_retain %1 : $Hello
 // CHECK-NEXT: [[STACK:%.*]] = alloc_stack $Hello
 // CHECK-NEXT: store %1 to [[STACK]]
